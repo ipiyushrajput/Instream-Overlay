@@ -8,6 +8,8 @@ playback never stalls.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -16,6 +18,8 @@ from typing import Awaitable, Callable, Optional
 from . import config
 from .codecs import VideoParams
 from .transcode import transcode_segment
+
+log = logging.getLogger("overlay.worker")
 
 
 class JobStatus(str, Enum):
@@ -72,6 +76,10 @@ class TranscodePool:
                   seq: int) -> Optional[JobStatus]:
         return self._status.get((channel_id, variant_index, overlay_id, seq))
 
+    def error_of(self, channel_id: str, variant_index: int, overlay_id: str,
+                 seq: int) -> Optional[str]:
+        return self._errors.get((channel_id, variant_index, overlay_id, seq))
+
     def segment_path(self, channel_id: str, variant_index: int, overlay_id: str,
                      seq: int) -> Path:
         return _out_path(channel_id, variant_index, overlay_id, seq)
@@ -90,6 +98,9 @@ class TranscodePool:
             return JobStatus.READY
         self._status[job.key] = JobStatus.PENDING
         self._queue.put_nowait(job)
+        log.info("queued transcode ch=%s v%s seq=%s overlay=%s origin=%s",
+                 job.channel_id, job.variant_index, job.seq, job.overlay_id,
+                 job.origin_url)
         return JobStatus.PENDING
 
     async def _emit(self, job: Job, status: JobStatus, error: str = "") -> None:
@@ -110,21 +121,30 @@ class TranscodePool:
             job = await self._queue.get()
             self._status[job.key] = JobStatus.PROCESSING
             await self._emit(job, JobStatus.PROCESSING)
+            started = time.monotonic()
             try:
                 out = _out_path(*job.key)
                 ok, err = await transcode_segment(
                     job.origin_url, job.overlay_image, job.vp, job.overlay_type,
                     job.x_frac, job.y_frac, job.scale_frac, out)
+                ms = int((time.monotonic() - started) * 1000)
                 if ok:
                     self._status[job.key] = JobStatus.READY
+                    size = out.stat().st_size if out.exists() else 0
+                    log.info("transcoded ch=%s v%s seq=%s in %dms (%d bytes)",
+                             job.channel_id, job.variant_index, job.seq, ms, size)
                     await self._emit(job, JobStatus.READY)
                 else:
                     self._status[job.key] = JobStatus.FAILED
                     self._errors[job.key] = err
+                    log.warning("transcode FAILED ch=%s v%s seq=%s after %dms",
+                                job.channel_id, job.variant_index, job.seq, ms)
                     await self._emit(job, JobStatus.FAILED, err)
             except Exception as exc:  # noqa: BLE001 - keep the worker alive
                 self._status[job.key] = JobStatus.FAILED
                 self._errors[job.key] = str(exc)
+                log.exception("transcode EXCEPTION ch=%s v%s seq=%s: %s",
+                              job.channel_id, job.variant_index, job.seq, exc)
                 await self._emit(job, JobStatus.FAILED, str(exc))
             finally:
                 self._queue.task_done()

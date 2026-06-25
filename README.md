@@ -93,3 +93,32 @@ curl -X POST http://127.0.0.1:8000/api/ingest \
 | `OVERLAY_BUFFER_SEGMENTS` | `3` | how far behind live we hold the output |
 | `OVERLAY_MAX_WORKERS` | `4` | concurrent ffmpeg transcodes |
 | `OVERLAY_DATA_DIR` | `/tmp/instream-overlay-data` | overlaid segments + uploads |
+| `OVERLAY_LOG_LEVEL` | `INFO` | set `DEBUG` to log the full ffmpeg command per transcode |
+| `OVERLAY_VERIFY_TLS` | `0` | set `1` to verify origin TLS certs |
+
+## Debugging "my overlay isn't showing"
+
+The backend logs each step under the `overlay.*` loggers (visible in the uvicorn
+output). Watch for:
+
+- `ingested channel=… variants=N` and per-variant codec/profile/level.
+- `overlay created (relative) … window=… origin_has_pdt=True/False`. If
+  **`origin_has_pdt=False`**, your origin omits `#EXT-X-PROGRAM-DATE-TIME`, and
+  overlay matching (which is wall-clock based) can't work — you'll also get a
+  loud `WARNING`.
+- `queued transcode …` → `transcoded … in Nms (bytes)` on success, or
+  `transcode FAILED …` with the **ffmpeg stderr** on failure (codec mismatch,
+  fMP4/CMAF segments, unreachable origin segment, etc.).
+- `child vN: … covered=C overlaid=O waiting=W`. If `covered=0`, the log prints
+  the exposed PDT range vs your overlay windows so you can see the mismatch.
+
+There's also a JSON **debug endpoint** that shows, for each origin segment, its
+PDT, which overlay covers it, and its transcode status + any error:
+
+```bash
+curl "http://127.0.0.1:8000/api/channels/<channel_id>/debug?variant_index=0" | jq
+```
+
+Note: because we hold the output `OVERLAY_BUFFER_SEGMENTS` behind the live edge,
+a freshly scheduled overlay near the live edge takes roughly
+`buffer × segment_duration` seconds to surface in the output — give it ~20s.

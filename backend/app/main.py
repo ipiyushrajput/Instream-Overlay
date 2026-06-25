@@ -1,6 +1,7 @@
 """FastAPI application: manifest mirror + overlay injection + operator API."""
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,9 +45,16 @@ def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+log = logging.getLogger("overlay.api")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
+    config.setup_logging()
+    log.info("starting up: buffer=%d segs, workers=%d, verify_tls=%s, data=%s",
+             config.BUFFER_SEGMENTS, config.MAX_TRANSCODE_WORKERS,
+             config.VERIFY_TLS, config.DATA_DIR)
     app.state.http = httpx.AsyncClient(timeout=config.ORIGIN_TIMEOUT,
                                        follow_redirects=True,
                                        verify=config.VERIFY_TLS)
@@ -133,6 +141,12 @@ async def ingest(req: IngestRequest):
     channel = Channel(id=new_id(), name=req.name or "channel",
                       master_url=req.master_url, variants=variants)
     store.add_channel(channel)
+    log.info("ingested channel=%s master=%s variants=%d", channel.id,
+             req.master_url, len(variants))
+    for v in variants:
+        log.info("  variant v%s: %s codecs=%s profile=%s level=%s fps=%s "
+                 "bitrate=%skbps origin=%s", v.index, v.resolution, v.codecs,
+                 v.profile, v.level, v.fps, v.bitrate_kbps, v.origin_uri)
     return channel
 
 
@@ -199,6 +213,9 @@ async def create_overlay(req: CreateOverlayRequest):
         start_pdt=_aware(req.start_pdt), end_pdt=_aware(req.end_pdt),
         x_frac=req.x_frac, y_frac=req.y_frac, scale_frac=req.scale_frac)
     store.add_overlay(overlay)
+    log.info("overlay created (absolute) id=%s ch=%s type=%s window=%s..%s",
+             overlay.id, overlay.channel_id, overlay.overlay_type.value,
+             overlay.start_pdt.isoformat(), overlay.end_pdt.isoformat())
     await _broadcast({"type": "overlay_created", "overlay": overlay.model_dump(mode="json")})
     return overlay
 
@@ -208,15 +225,24 @@ async def create_overlay_relative(req: CreateOverlayRelativeRequest):
     ch = store.get_channel(req.channel_id)
     if not ch or not ch.variants:
         raise HTTPException(404, "channel not found")
+    if not (config.UPLOAD_DIR / Path(req.image_filename).name).exists():
+        raise HTTPException(400, "image_filename not uploaded")
     text = await _fetch_text(ch.variants[0].origin_uri)
     pl = manifest.parse_media(text, ch.variants[0].origin_uri)
     edge = None
+    has_pdt = bool(pl.segments) and _parse_pdt(pl.segments[-1].pdt) is not None
     if pl.segments:
         pdt = _parse_pdt(pl.segments[-1].pdt)
         if pdt:
             edge = pdt + timedelta(seconds=pl.segments[-1].duration)
     if edge is None:
         edge = datetime.now(timezone.utc)
+    if not has_pdt:
+        # Without PDT we cannot match segments to a wall-clock window; overlay
+        # injection will never trigger. Surface this loudly.
+        log.warning("origin variant 0 has NO EXT-X-PROGRAM-DATE-TIME — overlay "
+                    "matching is PDT-based and will NOT work for this origin. "
+                    "(channel=%s)", req.channel_id)
     start = edge + timedelta(seconds=req.start_in_seconds)
     end = start + timedelta(seconds=req.duration_seconds)
     overlay = OverlayEvent(
@@ -224,6 +250,10 @@ async def create_overlay_relative(req: CreateOverlayRelativeRequest):
         image_filename=req.image_filename, start_pdt=start, end_pdt=end,
         x_frac=req.x_frac, y_frac=req.y_frac, scale_frac=req.scale_frac)
     store.add_overlay(overlay)
+    log.info("overlay created (relative) id=%s ch=%s type=%s edge=%s "
+             "window=%s..%s (origin_has_pdt=%s)", overlay.id, overlay.channel_id,
+             overlay.overlay_type.value, edge.isoformat(),
+             overlay.start_pdt.isoformat(), overlay.end_pdt.isoformat(), has_pdt)
     await _broadcast({"type": "overlay_created", "overlay": overlay.model_dump(mode="json")})
     return overlay
 
@@ -315,17 +345,21 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
     window_min = exposed[0].seq if exposed else pl.media_sequence
     inject_flags: dict[int, bool] = {}
     prev_overlaid = False
+    n_covered = n_ready = n_waiting = 0
 
     for seg in exposed:
         ov = overlay_for(seg)
         overlaid = False
         if ov is not None:
+            n_covered += 1
             status = pool.ensure(make_job(seg, ov))
             if status == JobStatus.READY:
                 seg.uri = (f"{config.PUBLIC_BASE_URL}/segment/{channel_id}/"
                            f"{variant_index}/{ov.id}/{seg.seq}.ts")
                 overlaid = True
-            # else: fall back to origin segment (no overlay this beat).
+                n_ready += 1
+            else:
+                n_waiting += 1  # fall back to origin segment (no overlay yet)
 
         injected = (overlaid != prev_overlaid)
         inject_flags[seg.seq] = injected
@@ -337,6 +371,20 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
     scrolled = _tracker(channel_id, variant_index).observe(inject_flags, window_min)
     pl.discontinuity_sequence = origin_disc_seq + scrolled
 
+    if overlays:
+        log.info("child v%s: origin=%d exposed=%d overlays=%d covered=%d "
+                 "overlaid=%d waiting=%d disc_seq=%d", variant_index,
+                 len(full_segments), len(exposed), len(overlays), n_covered,
+                 n_ready, n_waiting, pl.discontinuity_sequence)
+        if n_covered == 0 and exposed:
+            sp = _parse_pdt(exposed[0].pdt)
+            ep = _parse_pdt(exposed[-1].pdt)
+            log.info("  no segments matched any overlay window. exposed PDT "
+                     "range=%s..%s; overlay windows=%s",
+                     sp.isoformat() if sp else None,
+                     ep.isoformat() if ep else None,
+                     [(o.start_pdt.isoformat(), o.end_pdt.isoformat()) for o in overlays])
+
     return PlainTextResponse(manifest.render_media(pl),
                              media_type="application/vnd.apple.mpegurl")
 
@@ -345,8 +393,59 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
 async def serve_segment(channel_id: str, variant_index: int, overlay_id: str, seq: int):
     path = pool.segment_path(channel_id, variant_index, overlay_id, seq)
     if not path.exists():
+        log.warning("segment requested but not on disk: ch=%s v%s overlay=%s seq=%s",
+                    channel_id, variant_index, overlay_id, seq)
         raise HTTPException(404, "segment not ready")
     return FileResponse(path, media_type="video/mp2t")
+
+
+@app.get("/api/channels/{channel_id}/debug")
+async def debug_channel(channel_id: str, variant_index: int = 0):
+    """Per-segment view of why overlays are/aren't being applied: each origin
+    segment's PDT, which overlay (if any) covers it, and its transcode status
+    plus any ffmpeg error. The single best place to diagnose 'no overlay'."""
+    ch = store.get_channel(channel_id)
+    if not ch or variant_index >= len(ch.variants):
+        raise HTTPException(404, "channel/variant not found")
+    variant = ch.variants[variant_index]
+    text = await _fetch_text(variant.origin_uri)
+    pl = manifest.parse_media(text, variant.origin_uri)
+    overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
+
+    rows = []
+    for seg in pl.segments:
+        seg_pdt = _parse_pdt(seg.pdt)
+        covering = None
+        for o in overlays:
+            if seg_pdt is not None and o.covers(seg_pdt):
+                covering = o
+                break
+        status = err = None
+        if covering is not None:
+            st = pool.status_of(channel_id, variant_index, covering.id, seg.seq)
+            status = st.value if st else None
+            err = pool.error_of(channel_id, variant_index, covering.id, seg.seq)
+        rows.append({
+            "seq": seg.seq, "pdt": seg.pdt, "pdt_parsed": bool(seg_pdt),
+            "covered_by": covering.id if covering else None,
+            "transcode_status": status,
+            "error": (err[:400] if err else None),
+        })
+
+    return {
+        "channel_id": channel_id,
+        "variant_index": variant_index,
+        "origin_uri": variant.origin_uri,
+        "buffer_segments": config.BUFFER_SEGMENTS,
+        "origin_segment_count": len(pl.segments),
+        "any_segment_has_pdt": any(r["pdt_parsed"] for r in rows),
+        "active_overlays": [
+            {"id": o.id, "type": o.overlay_type.value,
+             "start_pdt": o.start_pdt.isoformat(), "end_pdt": o.end_pdt.isoformat(),
+             "image_exists": (config.UPLOAD_DIR / o.image_filename).exists()}
+            for o in overlays],
+        "segments": rows,
+    }
 
 
 @app.get("/api/health")
