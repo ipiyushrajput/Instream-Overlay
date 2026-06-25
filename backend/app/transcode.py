@@ -8,11 +8,14 @@ overlaid segment splices cleanly after an `#EXT-X-DISCONTINUITY`.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from . import config
 from .codecs import VideoParams, build_overlay_filter
 from .models import VariantInfo
+
+log = logging.getLogger("overlay.transcode")
 
 
 def variant_video_params(v: VariantInfo) -> VideoParams:
@@ -34,6 +37,8 @@ def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
     filt = build_overlay_filter(vp, overlay_type, x_frac, y_frac, scale_frac)
     cmd = [
         config.FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        # Bound network reads so a stalled origin fetch can't hang a worker.
+        "-rw_timeout", "15000000",
         "-copyts",
         "-i", origin_url,
         "-i", overlay_image,
@@ -41,8 +46,10 @@ def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
         "-map", "[v]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast",
         "-pix_fmt", vp.pix_fmt or "yuv420p",
-        # Force the first frame to be an IDR so the segment is self-contained.
-        "-force_key_frames", "expr:gte(t,0)",
+        # Force ONLY the first frame to be an IDR so the segment is
+        # self-contained (eq(n,0); gte(t,0) would make every frame a keyframe
+        # because -copyts keeps the original large PTS).
+        "-force_key_frames", "expr:eq(n,0)",
         "-sc_threshold", "0",
     ]
     if vp.profile:
@@ -69,11 +76,15 @@ async def transcode_segment(origin_url: str, overlay_image: str, vp: VideoParams
     tmp = out_path.with_suffix(".tmp.ts")
     cmd = build_command(origin_url, overlay_image, vp, overlay_type,
                         x_frac, y_frac, scale_frac, tmp)
+    log.debug("ffmpeg cmd: %s", " ".join(cmd))
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     _, stderr = await proc.communicate()
     if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
-        return False, stderr.decode("utf-8", "replace")[-2000:]
+        err = stderr.decode("utf-8", "replace")
+        log.warning("ffmpeg FAILED rc=%s origin=%s\n  cmd: %s\n  stderr: %s",
+                    proc.returncode, origin_url, " ".join(cmd), err[-1500:])
+        return False, err[-2000:]
     tmp.replace(out_path)
     return True, ""
