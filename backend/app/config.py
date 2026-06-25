@@ -40,6 +40,11 @@ ORIGIN_TIMEOUT = _int("OVERLAY_ORIGIN_TIMEOUT", 15)
 FFMPEG = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 
+# Verify TLS certificates when fetching origin manifests. Many live origins sit
+# behind CDNs with chains the host can't validate, so this defaults to off.
+# Set OVERLAY_VERIFY_TLS=1 to re-enable verification.
+VERIFY_TLS = os.environ.get("OVERLAY_VERIFY_TLS", "0") not in ("0", "false", "False", "")
+
 
 def ensure_dirs() -> None:
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
