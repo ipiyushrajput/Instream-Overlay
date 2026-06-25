@@ -17,10 +17,21 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urljoin
 
 _ATTR_RE = re.compile(r'([A-Z0-9\-]+)=("[^"]*"|[^,]*)')
+
+
+def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 # --- data structures -------------------------------------------------------
@@ -179,7 +190,33 @@ def parse_media(text: str, base_url: str) -> MediaPlaylist:
             pending_pdt = None
             pending_disc = False
             pending_extra = []
+
+    _forward_fill_pdt(pl)
     return pl
+
+
+def _forward_fill_pdt(pl: MediaPlaylist) -> None:
+    """Give every segment an effective PROGRAM-DATE-TIME.
+
+    Per the HLS spec, ``#EXT-X-PROGRAM-DATE-TIME`` is an *anchor* that applies to
+    the following segment; later segments' wall-clock is that anchor plus the
+    accumulated ``EXTINF`` durations. Many origins only stamp the first segment
+    (or one per discontinuity), so we reconstruct the rest here. We re-anchor on
+    every explicit tag and (best effort) carry the timeline across boundaries.
+
+    Segments that already carry an explicit tag keep their original string; only
+    the gaps are filled (with ISO8601 values), so overlay matching and the
+    rendered output both see a complete timeline.
+    """
+    running: Optional[datetime] = None
+    for seg in pl.segments:
+        explicit = _parse_iso(seg.pdt) if seg.pdt else None
+        if explicit is not None:
+            running = explicit
+        elif running is not None:
+            seg.pdt = running.isoformat()
+        if running is not None:
+            running = running + timedelta(seconds=seg.duration or 0.0)
 
 
 def render_media(pl: MediaPlaylist) -> str:
