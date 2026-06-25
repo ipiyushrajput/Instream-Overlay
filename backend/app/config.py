@@ -6,6 +6,7 @@ CloudFront/transmit origin on the user's own machine.
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -46,6 +47,24 @@ FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 VERIFY_TLS = os.environ.get("OVERLAY_VERIFY_TLS", "0") not in ("0", "false", "False", "")
 
 
+LOG_LEVEL = os.environ.get("OVERLAY_LOG_LEVEL", "INFO").upper()
+
+
 def ensure_dirs() -> None:
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def setup_logging() -> logging.Logger:
+    """Configure the ``overlay`` logger namespace with its own stdout handler so
+    our logs always show alongside uvicorn's, independent of root config."""
+    logger = logging.getLogger("overlay")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+            datefmt="%H:%M:%S"))
+        logger.addHandler(handler)
+        logger.propagate = False
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    return logger
