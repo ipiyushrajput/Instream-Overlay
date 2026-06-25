@@ -25,7 +25,7 @@ export default function App() {
       setBusy(true);
       const ch = await api.ingest(masterUrl, "channel");
       setChannel(ch);
-      pushLog(`Ingested ${ch.variants.length} variant(s) — channel ${ch.id}`);
+      pushLog(`Ingested ${ch.variants.length} variant(s) — channel ${ch.id.slice(0, 8)}`);
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -33,99 +33,131 @@ export default function App() {
     }
   }
 
-  async function refreshOverlays() {
+  async function stopIngestion() {
     if (!channel) return;
     try {
-      setOverlays(await api.listOverlays(channel.id));
+      await api.stopChannel(channel.id);
+      pushLog(`Stopped ingestion for ${channel.id.slice(0, 8)}`);
     } catch (e) { /* ignore */ }
+    setChannel(null);
+    setOverlays([]);
+    setStatus(null);
   }
 
-  // Poll live-edge/buffer status.
+  async function refreshOverlays() {
+    if (!channel) return;
+    try { setOverlays(await api.listOverlays(channel.id)); } catch (e) { /* ignore */ }
+  }
+
+  // Poll live-edge/buffer status + overlays (gentle intervals; WS pushes events).
   useEffect(() => {
     if (!channel) return;
     let alive = true;
-    const tick = async () => {
-      try {
-        const s = await api.channelStatus(channel.id);
-        if (alive) setStatus(s);
-      } catch (e) { /* ignore */ }
+    const tickStatus = async () => {
+      try { const s = await api.channelStatus(channel.id); if (alive) setStatus(s); }
+      catch (e) { /* ignore */ }
     };
-    tick();
-    const id = setInterval(tick, 3000);
+    tickStatus();
     refreshOverlays();
-    const id2 = setInterval(refreshOverlays, 4000);
-    return () => { alive = false; clearInterval(id); clearInterval(id2); };
+    const id1 = setInterval(tickStatus, 5000);
+    const id2 = setInterval(refreshOverlays, 6000);
+    return () => { alive = false; clearInterval(id1); clearInterval(id2); };
   }, [channel]);
 
-  // WebSocket for per-segment transcode status.
+  // WebSocket for live events (transcode status, overlay created/expired).
   useEffect(() => {
-    const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws";
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(API_BASE.replace(/^http/, "ws") + "/ws");
     wsRef.current = ws;
     ws.onmessage = (ev) => {
       try {
         const m = JSON.parse(ev.data);
-        if (m.type === "segment_status") {
-          pushLog(`seg v${m.variant_index} #${m.seq} → ${m.status}${m.error ? " (" + m.error + ")" : ""}`);
+        if (m.type === "segment_status" && m.status !== "processing") {
+          pushLog(`seg v${m.variant_index} #${m.seq} → ${m.status}${m.error ? " (" + m.error.slice(0, 80) + ")" : ""}`);
         } else if (m.type === "overlay_created") {
-          pushLog(`overlay scheduled ${m.overlay.start_pdt} → ${m.overlay.end_pdt}`);
-        } else if (m.type === "overlay_deleted") {
-          pushLog(`overlay deleted ${m.overlay_id}`);
+          pushLog(`overlay scheduled`);
+          refreshOverlays();
+        } else if (m.type === "overlay_deleted" || m.type === "channel_stopped") {
+          refreshOverlays();
         }
       } catch (e) { /* ignore */ }
     };
     ws.onclose = () => pushLog("status websocket closed");
     return () => ws.close();
-  }, []);
+  }, []); // eslint-disable-line
+
+  const liveOn = !!status?.live_edge_pdt;
 
   return (
     <div className="app">
-      <header>
-        <h1>Instream Overlay — Operator Console</h1>
-        <span className="sub">Transmit-style L-band / in-stream overlay injection</span>
+      <header className="topbar">
+        <div className="brand">
+          <div className="logo">▶</div>
+          <div>
+            <h1>Instream Overlay</h1>
+            <div className="sub">L-band &amp; in-stream overlay injection for live HLS</div>
+          </div>
+        </div>
+        <div className={`live-pill ${liveOn ? "on" : ""}`}>
+          <span className="dot" /> {liveOn ? "LIVE" : "idle"}
+        </div>
       </header>
 
-      <section className="ingest">
+      <div className="ingest">
         <input
           value={masterUrl}
           onChange={(e) => setMasterUrl(e.target.value)}
-          placeholder="HLS master manifest URL"
+          placeholder="HLS master manifest URL (e.g. https://cdn…/stream.m3u8)"
+          disabled={!!channel}
         />
-        <button onClick={ingest} disabled={busy}>
-          {busy ? "Ingesting…" : "Ingest"}
-        </button>
-        {channel && (
-          <a className="outlink" href={api.masterUrl(channel.id)} target="_blank" rel="noreferrer">
-            output master.m3u8 ↗
-          </a>
+        {!channel ? (
+          <button onClick={ingest} disabled={busy}>{busy ? "Ingesting…" : "Ingest"}</button>
+        ) : (
+          <button className="danger" onClick={stopIngestion}>Stop ingestion</button>
         )}
-      </section>
+      </div>
       {err && <p className="error">{err}</p>}
 
       <div className="grid">
         <div className="left">
-          <div className="panel">
-            <h3>Output preview (our stream)</h3>
+          <div className="card">
+            <div className="card-head">
+              <h3>Output preview</h3>
+              {channel && (
+                <a className="hint" href={api.masterUrl(channel.id)} target="_blank" rel="noreferrer">
+                  open output .m3u8 ↗
+                </a>
+              )}
+            </div>
             {channel ? <Player src={api.masterUrl(channel.id)} /> :
               <div className="placeholder">Ingest a stream to begin.</div>}
             {status && (
-              <div className="status-bar">
-                <span>live edge: <b>{status.live_edge_pdt || "—"}</b></span>
-                <span>buffer: <b>{status.buffer_segments} seg</b></span>
-                <span>window: <b>{status.segment_count} seg</b></span>
+              <div className="stats">
+                <div className="stat"><div className="k">Live edge</div>
+                  <div className="v">{fmtTime(status.live_edge_pdt)}</div></div>
+                <div className="stat"><div className="k">Buffer</div>
+                  <div className="v">{status.buffer_segments} seg</div></div>
+                <div className="stat"><div className="k">Min lead</div>
+                  <div className="v">{status.min_lead_seconds}s</div></div>
+                <div className="stat"><div className="k">Window</div>
+                  <div className="v">{status.segment_count} seg</div></div>
+                <div className="stat"><div className="k">Active</div>
+                  <div className="v">{status.active_overlays}</div></div>
               </div>
             )}
           </div>
 
-          <div className="panel">
-            <h3>Active overlays</h3>
-            {overlays.length === 0 && <p className="hint">None scheduled.</p>}
+          <div className="card">
+            <h3>Scheduled overlays</h3>
+            {overlays.length === 0 && <p className="hint">None yet. Add one on the right →</p>}
             <ul className="overlays">
               {overlays.map((o) => (
                 <li key={o.id}>
-                  <span className="tag">{o.overlay_type}</span>
-                  <span className="times">{fmt(o.start_pdt)} → {fmt(o.end_pdt)}</span>
-                  <button className="del" onClick={async () => { await api.deleteOverlay(o.id); refreshOverlays(); }}>✕</button>
+                  <span className={`chip ${o.status}`}>{o.status}</span>
+                  <span className="ov-type">{o.overlay_type.replace("_", " ")}</span>
+                  <span className="ov-times">{fmtTime(o.start_pdt)} → {fmtTime(o.end_pdt)}</span>
+                  {o.injected_count > 0 && <span className="ov-inj">{o.injected_count} seg</span>}
+                  <button className="del" title="delete"
+                          onClick={async () => { await api.deleteOverlay(o.id); refreshOverlays(); }}>✕</button>
                 </li>
               ))}
             </ul>
@@ -133,10 +165,15 @@ export default function App() {
         </div>
 
         <div className="right">
-          {channel && <OverlayControls channelId={channel.id} onChange={refreshOverlays} />}
-          <div className="panel log">
+          {channel ? (
+            <OverlayControls channelId={channel.id} minLead={status?.min_lead_seconds || 12}
+                             onChange={refreshOverlays} />
+          ) : (
+            <div className="card"><p className="hint">Overlay controls appear once a stream is ingested.</p></div>
+          )}
+          <div className="card log">
             <h3>Activity</h3>
-            <pre>{log.join("\n")}</pre>
+            <pre>{log.join("\n") || "—"}</pre>
           </div>
         </div>
       </div>
@@ -144,6 +181,7 @@ export default function App() {
   );
 }
 
-function fmt(iso) {
+function fmtTime(iso) {
+  if (!iso) return "—";
   try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
 }

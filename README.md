@@ -75,15 +75,30 @@ curl -X POST http://127.0.0.1:8000/api/ingest \
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/ingest` | register an origin master; probes variants |
+| GET  | `/api/channels/{cid}/status` | live edge, buffer, `min_lead_seconds`, active overlays |
+| DELETE | `/api/channels/{cid}` | **stop ingestion** — drops channel, overlays, timelines |
 | GET  | `/hls/{cid}/master.m3u8` | our mirrored master (play this) |
 | GET  | `/manifest/{cid}/{sess}/{v}.m3u8` | child manifest w/ overlay injection |
-| GET  | `/segment/{cid}/{v}/{ov}/{seq}.ts` | a transcoded overlay segment |
+| GET  | `/segment/{cid}/{v}/{ov}/{seq}.ts` | a transcoded overlay segment (referenced **relatively**) |
 | POST | `/api/overlays/upload` | upload an overlay image |
 | POST | `/api/overlays` | schedule overlay by absolute PDT window |
-| POST | `/api/overlays/relative` | schedule overlay N seconds ahead of live edge |
-| GET  | `/api/channels/{cid}/overlays` | list overlays |
+| POST | `/api/overlays/relative` | schedule overlay N seconds ahead (clamped to `min_lead_seconds`) |
+| GET  | `/api/channels/{cid}/overlays` | list overlays with `status` (scheduled/active/completed/expired) + `injected_count` |
 | DELETE | `/api/overlays/{id}` | remove an overlay |
-| WS   | `/ws` | per-segment transcode status |
+| GET  | `/api/channels/{cid}/debug` | per-segment PDT / coverage / transcode status |
+| WS   | `/ws` | per-segment transcode + overlay lifecycle events |
+
+### Playback correctness (how the live playlist stays valid)
+
+Each segment's fate (origin vs overlaid) is **frozen the first time it is
+published** and never changes on reload — satisfying the HLS rule that a
+segment at a given Media Sequence Number is immutable. The live edge **waits**
+for an overlay transcode to be ready before publishing that segment (rather than
+publishing origin and swapping later), and `EXT-X-DISCONTINUITY-SEQUENCE` is
+incremented as discontinuities scroll out, per RFC 8216. Overlay segments are
+referenced with **relative** URLs (`/segment/…`); origin segments keep their
+absolute origin URLs. This is what eliminates the `levelParsingError` /
+buffering you get when a manifest mutates already-published segments.
 
 ## Configuration (env vars)
 
