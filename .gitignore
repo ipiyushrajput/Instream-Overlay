@@ -10,3 +10,4 @@ frontend/dist/
 # Runtime data
 /tmp/instream-overlay-data/
 *.log
+logs/
