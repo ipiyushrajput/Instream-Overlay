@@ -15,6 +15,7 @@ async function json(method, path, body) {
 export const api = {
   ingest: (master_url, name) => json("POST", "/api/ingest", { master_url, name }),
   getChannel: (id) => json("GET", `/api/channels/${id}`),
+  stopChannel: (id) => json("DELETE", `/api/channels/${id}`),
   channelStatus: (id) => json("GET", `/api/channels/${id}/status`),
   listOverlays: (id) => json("GET", `/api/channels/${id}/overlays`),
   createRelative: (payload) => json("POST", "/api/overlays/relative", payload),
