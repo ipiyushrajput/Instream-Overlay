@@ -7,8 +7,12 @@ CloudFront/transmit origin on the user's own machine.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 from pathlib import Path
+
+# Repo root = .../<repo>/backend/app/config.py -> parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _int(name: str, default: int) -> int:
@@ -48,23 +52,48 @@ VERIFY_TLS = os.environ.get("OVERLAY_VERIFY_TLS", "0") not in ("0", "false", "Fa
 
 
 LOG_LEVEL = os.environ.get("OVERLAY_LOG_LEVEL", "INFO").upper()
+# Logs live in <repo>/logs by default (sibling of backend/ and frontend/).
+LOG_DIR = Path(os.environ.get("OVERLAY_LOG_DIR", REPO_ROOT / "logs"))
 
 
 def ensure_dirs() -> None:
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def setup_logging() -> logging.Logger:
-    """Configure the ``overlay`` logger namespace with its own stdout handler so
-    our logs always show alongside uvicorn's, independent of root config."""
+    """Configure the ``overlay`` logger with a stdout handler (so logs show in
+    the uvicorn console) plus a rotating file handler in ``<repo>/logs``. The
+    same file handler is attached to uvicorn's loggers so HTTP access/errors
+    land in the file too."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_DIR / "backend.log", maxBytes=5_000_000, backupCount=5)
+    file_handler.setFormatter(fmt)
+
     logger = logging.getLogger("overlay")
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-            datefmt="%H:%M:%S"))
-        logger.addHandler(handler)
-        logger.propagate = False
-    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    if not any(isinstance(h, logging.StreamHandler) and
+               not isinstance(h, logging.handlers.RotatingFileHandler)
+               for h in logger.handlers):
+        stream = logging.StreamHandler()
+        stream.setFormatter(fmt)
+        logger.addHandler(stream)
+    # Avoid duplicate file handlers on reload.
+    if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in logger.handlers):
+        logger.addHandler(file_handler)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    # Capture uvicorn's request/error logs in the same file.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        ul = logging.getLogger(name)
+        if not any(isinstance(h, logging.handlers.RotatingFileHandler)
+                   for h in ul.handlers):
+            ul.addHandler(file_handler)
     return logger

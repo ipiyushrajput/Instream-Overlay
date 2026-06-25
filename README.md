@@ -98,8 +98,10 @@ curl -X POST http://127.0.0.1:8000/api/ingest \
 
 ## Debugging "my overlay isn't showing"
 
-The backend logs each step under the `overlay.*` loggers (visible in the uvicorn
-output). Watch for:
+The backend logs each step under the `overlay.*` loggers — to the uvicorn
+console **and** to a rotating file at **`logs/backend.log`** (repo root; override
+with `OVERLAY_LOG_DIR`). uvicorn's own request/error logs are captured there too.
+Watch for:
 
 - `ingested channel=… variants=N` and per-variant codec/profile/level.
 - `overlay created (relative) … window=… origin_has_pdt=True/False`. If
