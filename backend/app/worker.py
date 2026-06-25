@@ -150,27 +150,4 @@ class TranscodePool:
                 self._queue.task_done()
 
 
-class DiscontinuityTracker:
-    """Tracks how many *injected* discontinuities have scrolled out of the live
-    window for one (channel, variant) so EXT-X-DISCONTINUITY-SEQUENCE stays
-    correct as the playlist slides.
-
-    Origin-native discontinuities are accounted for by the origin's own
-    DISCONTINUITY-SEQUENCE; we only add the ones we introduce.
-    """
-    def __init__(self) -> None:
-        self._injected: dict[int, bool] = {}   # seq -> had injected discontinuity
-        self._scrolled_out = 0
-
-    def observe(self, window_seqs_with_inject: dict[int, bool], window_min_seq: int) -> int:
-        # Record current window's injected-discontinuity flags.
-        for seq, has in window_seqs_with_inject.items():
-            self._injected[seq] = has
-        # Anything below the window's first seq has scrolled out for good.
-        for seq in sorted(s for s in self._injected if s < window_min_seq):
-            if self._injected.pop(seq):
-                self._scrolled_out += 1
-        return self._scrolled_out
-
-
 pool = TranscodePool()

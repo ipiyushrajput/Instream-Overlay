@@ -1,7 +1,9 @@
 """FastAPI application: manifest mirror + overlay injection + operator API."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,18 +19,48 @@ from .codecs import video_params_from_variant
 from .models import (Channel, CreateOverlayRelativeRequest, CreateOverlayRequest,
                      IngestRequest, OverlayEvent, VariantInfo)
 from .store import new_id, store
+from .timeline import VariantTimeline
 from .transcode import variant_video_params
-from .worker import DiscontinuityTracker, Job, JobStatus, pool
+from .worker import Job, JobStatus, pool
 
-# Per-(channel, variant) discontinuity-sequence trackers.
-_trackers: dict[tuple, DiscontinuityTracker] = {}
+# Per-(channel, variant) frozen-decision timelines.
+_timelines: dict[tuple, VariantTimeline] = {}
 
 
-def _tracker(channel_id: str, variant_index: int) -> DiscontinuityTracker:
+def _timeline(channel_id: str, variant_index: int) -> VariantTimeline:
     key = (channel_id, variant_index)
-    if key not in _trackers:
-        _trackers[key] = DiscontinuityTracker()
-    return _trackers[key]
+    if key not in _timelines:
+        _timelines[key] = VariantTimeline()
+    return _timelines[key]
+
+
+def _drop_timelines(channel_id: str) -> None:
+    for key in [k for k in _timelines if k[0] == channel_id]:
+        _timelines.pop(key, None)
+
+
+# Short-TTL cache of origin manifests, shared across player + status requests so
+# we don't hammer the origin (one fetch per variant per ~1.5s instead of one per
+# caller). Keyed by origin child URL.
+_origin_cache: dict[str, tuple[float, str]] = {}
+_origin_locks: dict[str, asyncio.Lock] = {}
+ORIGIN_CACHE_TTL = 1.5
+
+
+async def _fetch_origin_cached(http: httpx.AsyncClient, url: str) -> str:
+    now = time.monotonic()
+    hit = _origin_cache.get(url)
+    if hit and now - hit[0] < ORIGIN_CACHE_TTL:
+        return hit[1]
+    lock = _origin_locks.setdefault(url, asyncio.Lock())
+    async with lock:
+        hit = _origin_cache.get(url)
+        if hit and time.monotonic() - hit[0] < ORIGIN_CACHE_TTL:
+            return hit[1]
+        resp = await http.get(url)
+        resp.raise_for_status()
+        _origin_cache[url] = (time.monotonic(), resp.text)
+        return resp.text
 
 
 def _parse_pdt(value: Optional[str]) -> Optional[datetime]:
@@ -43,6 +75,38 @@ def _parse_pdt(value: Optional[str]) -> Optional[datetime]:
 
 def _aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _live_edge_pdt(pl: manifest.MediaPlaylist) -> Optional[datetime]:
+    """Wall-clock at the live edge = last segment's PDT + its duration."""
+    if not pl.segments:
+        return None
+    pdt = _parse_pdt(pl.segments[-1].pdt)
+    if pdt is None:
+        return None
+    return pdt + timedelta(seconds=pl.segments[-1].duration or 0.0)
+
+
+def _overlay_status(overlay: OverlayEvent, edge: Optional[datetime]) -> str:
+    """scheduled -> active -> completed, derived from the live edge."""
+    injected = store.injected_count(overlay.id)
+    if edge is None:
+        return "scheduled"
+    if edge < overlay.start_pdt:
+        return "scheduled"
+    if edge < overlay.end_pdt:
+        return "active"
+    # Window has fully passed the live edge.
+    return "completed" if injected else "expired"
+
+
+def _min_lead_seconds(target_duration: int) -> int:
+    """Minimum lead before an overlay window starts. The transcode headroom is
+    already the buffer depth (segments are transcoded while held back), so the
+    lead only needs to push the window just past the current live edge. Two
+    segment durations gives comfortable margin (~10-12s)."""
+    td = target_duration or 6
+    return int(2 * td)
 
 
 log = logging.getLogger("overlay.api")
@@ -169,17 +233,23 @@ async def channel_status(channel_id: str):
     ch = store.get_channel(channel_id)
     if not ch or not ch.variants:
         raise HTTPException(404, "channel not found")
-    text = await _fetch_text(ch.variants[0].origin_uri)
+    text = await _fetch_origin_cached(app.state.http, ch.variants[0].origin_uri)
     pl = manifest.parse_media(text, ch.variants[0].origin_uri)
-    edge = None
-    if pl.segments:
-        last = pl.segments[-1]
-        pdt = _parse_pdt(last.pdt)
-        if pdt:
-            edge = (pdt + timedelta(seconds=last.duration)).isoformat()
-    return {"channel_id": channel_id, "live_edge_pdt": edge,
-            "buffer_segments": config.BUFFER_SEGMENTS,
-            "segment_count": len(pl.segments)}
+    edge = _live_edge_pdt(pl)
+    overlays = store.overlays_for_channel(channel_id)
+    return {
+        "channel_id": channel_id,
+        "name": ch.name,
+        "live_edge_pdt": edge.isoformat() if edge else None,
+        "origin_has_pdt": edge is not None,
+        "buffer_segments": config.BUFFER_SEGMENTS,
+        "target_duration": pl.target_duration,
+        "min_lead_seconds": _min_lead_seconds(pl.target_duration),
+        "segment_count": len(pl.segments),
+        "overlay_count": len(overlays),
+        "active_overlays": sum(1 for o in overlays
+                               if _overlay_status(o, edge) == "active"),
+    }
 
 
 # --- overlays --------------------------------------------------------------
@@ -227,23 +297,20 @@ async def create_overlay_relative(req: CreateOverlayRelativeRequest):
         raise HTTPException(404, "channel not found")
     if not (config.UPLOAD_DIR / Path(req.image_filename).name).exists():
         raise HTTPException(400, "image_filename not uploaded")
-    text = await _fetch_text(ch.variants[0].origin_uri)
+    text = await _fetch_origin_cached(app.state.http, ch.variants[0].origin_uri)
     pl = manifest.parse_media(text, ch.variants[0].origin_uri)
-    edge = None
-    has_pdt = bool(pl.segments) and _parse_pdt(pl.segments[-1].pdt) is not None
-    if pl.segments:
-        pdt = _parse_pdt(pl.segments[-1].pdt)
-        if pdt:
-            edge = pdt + timedelta(seconds=pl.segments[-1].duration)
+    edge = _live_edge_pdt(pl)
+    has_pdt = edge is not None
     if edge is None:
         edge = datetime.now(timezone.utc)
-    if not has_pdt:
-        # Without PDT we cannot match segments to a wall-clock window; overlay
-        # injection will never trigger. Surface this loudly.
         log.warning("origin variant 0 has NO EXT-X-PROGRAM-DATE-TIME — overlay "
                     "matching is PDT-based and will NOT work for this origin. "
                     "(channel=%s)", req.channel_id)
-    start = edge + timedelta(seconds=req.start_in_seconds)
+    # Enforce a minimum lead so the segments are transcoded before they reach the
+    # buffer-held live edge (item 7). Clamp up rather than reject.
+    min_lead = _min_lead_seconds(pl.target_duration)
+    start_in = max(float(req.start_in_seconds), float(min_lead))
+    start = edge + timedelta(seconds=start_in)
     end = start + timedelta(seconds=req.duration_seconds)
     overlay = OverlayEvent(
         id=new_id(), channel_id=req.channel_id, overlay_type=req.overlay_type,
@@ -260,7 +327,24 @@ async def create_overlay_relative(req: CreateOverlayRelativeRequest):
 
 @app.get("/api/channels/{channel_id}/overlays")
 async def list_overlays(channel_id: str):
-    return store.overlays_for_channel(channel_id)
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    edge = None
+    if ch.variants:
+        try:
+            text = await _fetch_origin_cached(app.state.http, ch.variants[0].origin_uri)
+            edge = _live_edge_pdt(manifest.parse_media(text, ch.variants[0].origin_uri))
+        except Exception:  # noqa: BLE001
+            edge = None
+    out = []
+    for o in store.overlays_for_channel(channel_id):
+        d = o.model_dump(mode="json")
+        d["status"] = _overlay_status(o, edge)
+        d["injected_count"] = store.injected_count(o.id)
+        out.append(d)
+    out.sort(key=lambda d: d["start_pdt"])
+    return out
 
 
 @app.delete("/api/overlays/{overlay_id}")
@@ -268,6 +352,24 @@ async def delete_overlay(overlay_id: str):
     if not store.delete_overlay(overlay_id):
         raise HTTPException(404, "not found")
     await _broadcast({"type": "overlay_deleted", "overlay_id": overlay_id})
+    return {"ok": True}
+
+
+@app.delete("/api/channels/{channel_id}")
+async def stop_channel(channel_id: str):
+    """Stop ingestion for a channel: removes it and its overlays, drops the
+    frozen timelines and cached origin manifests. The frontend stops polling
+    once this returns. Transcoded files on disk are left for cache reuse."""
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    for v in ch.variants:
+        _origin_cache.pop(v.origin_uri, None)
+        _origin_locks.pop(v.origin_uri, None)
+    _drop_timelines(channel_id)
+    store.delete_channel(channel_id)
+    log.info("stopped channel=%s", channel_id)
+    await _broadcast({"type": "channel_stopped", "channel_id": channel_id})
     return {"ok": True}
 
 
@@ -300,15 +402,14 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
     variant = ch.variants[variant_index]
 
     try:
-        text = await _fetch_text(variant.origin_uri)
+        text = await _fetch_origin_cached(app.state.http, variant.origin_uri)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"origin fetch failed: {exc}")
 
     pl = manifest.parse_media(text, variant.origin_uri)
-    origin_disc_seq = pl.discontinuity_sequence
-
     overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
     vp = variant_video_params(variant)
+    tl = _timeline(channel_id, variant_index)
 
     def overlay_for(seg) -> Optional[OverlayEvent]:
         seg_pdt = _parse_pdt(seg.pdt)
@@ -328,64 +429,41 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
             x_frac=overlay.x_frac, y_frac=overlay.y_frac,
             scale_frac=overlay.scale_frac)
 
-    # Look-ahead pass over the FULL origin window (including the buffered tail we
-    # will hold back) so transcodes for soon-to-be-exposed segments start early.
-    full_segments = pl.segments
-    for seg in full_segments:
+    # Look-ahead: kick off transcodes for EVERY covered segment in the full
+    # origin window (including the buffered tail) so they're ready before the
+    # frozen edge reaches them.
+    for seg in pl.segments:
         ov = overlay_for(seg)
-        if ov is not None:
+        if ov is not None and seg.seq > tl.max_frozen_seq:
             pool.ensure(make_job(seg, ov))
 
-    # Hold the live edge back so overlay transcodes have time to complete.
-    exposed = full_segments
-    if not pl.endlist and config.BUFFER_SEGMENTS > 0 and \
-            len(full_segments) > config.BUFFER_SEGMENTS:
-        exposed = full_segments[:-config.BUFFER_SEGMENTS]
-
-    window_min = exposed[0].seq if exposed else pl.media_sequence
-    inject_flags: dict[int, bool] = {}
-    prev_overlaid = False
-    n_covered = n_ready = n_waiting = 0
-
-    for seg in exposed:
+    def decide(seg):
+        """origin / overlay(READY) / None(wait) — see timeline.DecideFn."""
         ov = overlay_for(seg)
-        overlaid = False
-        if ov is not None:
-            n_covered += 1
-            status = pool.ensure(make_job(seg, ov))
-            if status == JobStatus.READY:
-                seg.uri = (f"{config.PUBLIC_BASE_URL}/segment/{channel_id}/"
-                           f"{variant_index}/{ov.id}/{seg.seq}.ts")
-                overlaid = True
-                n_ready += 1
-            else:
-                n_waiting += 1  # fall back to origin segment (no overlay yet)
+        if ov is None:
+            return ("origin", seg.uri, None)
+        status = pool.ensure(make_job(seg, ov))
+        if status == JobStatus.READY:
+            store.mark_injected(ov.id, seg.seq)
+            rel = f"/segment/{channel_id}/{variant_index}/{ov.id}/{seg.seq}.ts"
+            return ("overlay", rel, ov.id)
+        if status == JobStatus.FAILED:
+            return ("origin", seg.uri, None)  # don't wait on a failed transcode
+        return None  # pending -> hold the edge here until it's ready
 
-        injected = (overlaid != prev_overlaid)
-        inject_flags[seg.seq] = injected
-        seg.discontinuity_before = seg.discontinuity_before or injected
-        prev_overlaid = overlaid
+    before_max = tl.max_frozen_seq
+    tl.advance(pl.segments, config.BUFFER_SEGMENTS, decide)
+    out = tl.render(pl.discontinuity_sequence, pl.target_duration,
+                    version=pl.version, header_tags=pl.header_tags)
 
-    pl.segments = exposed
-    pl.media_sequence = window_min
-    scrolled = _tracker(channel_id, variant_index).observe(inject_flags, window_min)
-    pl.discontinuity_sequence = origin_disc_seq + scrolled
+    if overlays and tl.max_frozen_seq != before_max:
+        n_overlay = sum(1 for d in tl.frozen.values() if d.kind == "overlay")
+        log.info("child v%s: origin=%d exposed=%d overlays=%d overlaid=%d "
+                 "disc_seq=%d edge_seq=%d", variant_index, len(pl.segments),
+                 len(out.segments), len(overlays), n_overlay,
+                 out.discontinuity_sequence, tl.max_frozen_seq)
 
-    if overlays:
-        log.info("child v%s: origin=%d exposed=%d overlays=%d covered=%d "
-                 "overlaid=%d waiting=%d disc_seq=%d", variant_index,
-                 len(full_segments), len(exposed), len(overlays), n_covered,
-                 n_ready, n_waiting, pl.discontinuity_sequence)
-        if n_covered == 0 and exposed:
-            sp = _parse_pdt(exposed[0].pdt)
-            ep = _parse_pdt(exposed[-1].pdt)
-            log.info("  no segments matched any overlay window. exposed PDT "
-                     "range=%s..%s; overlay windows=%s",
-                     sp.isoformat() if sp else None,
-                     ep.isoformat() if ep else None,
-                     [(o.start_pdt.isoformat(), o.end_pdt.isoformat()) for o in overlays])
-
-    return PlainTextResponse(manifest.render_media(pl),
+    return PlainTextResponse(manifest.render_media(out),
                              media_type="application/vnd.apple.mpegurl")
 
 
