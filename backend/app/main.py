@@ -47,7 +47,9 @@ def _aware(dt: datetime) -> datetime:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
-    app.state.http = httpx.AsyncClient(timeout=config.ORIGIN_TIMEOUT, follow_redirects=True)
+    app.state.http = httpx.AsyncClient(timeout=config.ORIGIN_TIMEOUT,
+                                       follow_redirects=True,
+                                       verify=config.VERIFY_TLS)
     pool.set_status_callback(_broadcast)
     pool.start()
     yield
