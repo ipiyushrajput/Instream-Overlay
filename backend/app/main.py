@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from . import config, db, manifest
+from . import config, db, defaults, manifest
 from .codecs import video_params_from_variant
 from .models import (Channel, CreateOverlayRelativeRequest, CreateOverlayRequest,
                      IngestRequest, OverlayEvent, UpdateChannelRequest, VariantInfo)
@@ -120,6 +120,7 @@ async def lifespan(app: FastAPI):
              config.VERIFY_TLS, config.DATA_DIR)
     db.init()
     store.load_from_db()
+    defaults.ensure_default_overlays()
     app.state.http = httpx.AsyncClient(timeout=config.ORIGIN_TIMEOUT,
                                        follow_redirects=True,
                                        verify=config.VERIFY_TLS)
@@ -282,12 +283,36 @@ async def channel_status(channel_id: str):
 
 # --- overlays --------------------------------------------------------------
 
+@app.get("/api/defaults")
+async def list_default_overlays():
+    """Built-in overlay band presets (item 7) — no upload needed."""
+    return defaults.list_defaults()
+
+
 @app.post("/api/overlays/upload")
 async def upload_overlay(file: UploadFile = File(...)):
     config.ensure_dirs()
     name = f"{new_id()}_{Path(file.filename or 'overlay.png').name}"
     dest = config.UPLOAD_DIR / name
     dest.write_bytes(await file.read())
+    return {"image_filename": name, "url": f"{config.PUBLIC_BASE_URL}/uploads/{name}"}
+
+
+@app.post("/api/overlays/from-url")
+async def overlay_from_url(payload: dict):
+    """Import an overlay image from a URL the user provides (item 7)."""
+    url = (payload or {}).get("url", "").strip()
+    if not url:
+        raise HTTPException(400, "url required")
+    try:
+        resp = await app.state.http.get(url)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"failed to fetch image: {exc}")
+    config.ensure_dirs()
+    ext = Path(url.split("?")[0]).suffix or ".png"
+    name = f"{new_id()}{ext}"
+    (config.UPLOAD_DIR / name).write_bytes(resp.content)
     return {"image_filename": name, "url": f"{config.PUBLIC_BASE_URL}/uploads/{name}"}
 
 
