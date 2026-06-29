@@ -21,7 +21,9 @@ export const api = {
   listChannels: () => req("GET", "/api/channels"),
   getChannel: (id) => req("GET", `/api/channels/${id}`),
   updateChannel: (id, patch) => req("PUT", `/api/channels/${id}`, patch),
-  stopChannel: (id) => req("DELETE", `/api/channels/${id}`),
+  stopChannel: (id) => req("POST", `/api/channels/${id}/stop`),
+  startChannel: (id) => req("POST", `/api/channels/${id}/start`),
+  deleteChannel: (id) => req("DELETE", `/api/channels/${id}`),
   channelStatus: (id) => req("GET", `/api/channels/${id}/status`),
   channelDebug: (id, v = 0) => req("GET", `/api/channels/${id}/debug?variant_index=${v}`),
 
