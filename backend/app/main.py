@@ -182,16 +182,18 @@ async def ingest(req: IngestRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Failed to fetch master: {exc}")
 
+    master_other_lines: list[str] = []
     if not manifest.is_master(text):
         # Single-variant playlist: synthesize one variant pointing at it.
         variants = [VariantInfo(index=0, origin_uri=req.master_url,
                                 inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")]
     else:
-        parsed = manifest.parse_master(text, req.master_url)
-        if not parsed:
+        master = manifest.parse_master(text, req.master_url)
+        if not master.variants:
             raise HTTPException(400, "No variants found in master playlist")
+        master_other_lines = master.other_lines
         variants = []
-        for idx, mv in enumerate(parsed):
+        for idx, mv in enumerate(master.variants):
             vp = video_params_from_variant(mv.codecs, mv.resolution,
                                            mv.frame_rate, mv.bandwidth)
             variants.append(VariantInfo(
@@ -203,7 +205,8 @@ async def ingest(req: IngestRequest):
                 bitrate_kbps=vp.bitrate_kbps))
 
     channel = Channel(id=new_id(), name=req.name or "channel",
-                      master_url=req.master_url, variants=variants)
+                      master_url=req.master_url, variants=variants,
+                      master_other_lines=master_other_lines)
     store.add_channel(channel)
     log.info("ingested channel=%s master=%s variants=%d", channel.id,
              req.master_url, len(variants))
@@ -382,7 +385,12 @@ async def serve_master(channel_id: str):
         raise HTTPException(404, "channel not found")
     session = new_id()
     started = int(datetime.now(timezone.utc).timestamp() * 1000)
-    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    # Preserve the origin master's header lines (EXT-X-INDEPENDENT-SEGMENTS,
+    # EXT-X-MEDIA audio/subtitle renditions, …); fall back to a minimal header.
+    out = list(ch.master_other_lines) if ch.master_other_lines else \
+        ["#EXTM3U", "#EXT-X-VERSION:3"]
+    if not out or out[0] != "#EXTM3U":
+        out.insert(0, "#EXTM3U")
     for v in ch.variants:
         w = v.width or ""
         h = v.height or ""
@@ -452,9 +460,11 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
         return None  # pending -> hold the edge here until it's ready
 
     before_max = tl.max_frozen_seq
-    tl.advance(pl.segments, config.BUFFER_SEGMENTS, decide)
+    # Mirror the origin's window length so the output isn't shorter than origin.
+    window_size = len(pl.segments) or 1
+    tl.advance(pl.segments, config.BUFFER_SEGMENTS, decide, window_size)
     out = tl.render(pl.discontinuity_sequence, pl.target_duration,
-                    version=pl.version, header_tags=pl.header_tags)
+                    version=pl.version, header_extra=pl.header_extra)
 
     if overlays and tl.max_frozen_seq != before_max:
         n_overlay = sum(1 for d in tl.frozen.values() if d.kind == "overlay")
