@@ -76,9 +76,17 @@ class MasterVariant:
 
 
 @dataclass
+class Rendition:
+    idx: int
+    line: str          # original #EXT-X-MEDIA line (URI still pointing at origin)
+    origin_uri: str    # absolute origin URI of the rendition playlist
+
+
+@dataclass
 class MasterPlaylist:
     other_lines: list = field(default_factory=list)  # verbatim non-variant lines
     variants: list = field(default_factory=list)     # list[MasterVariant]
+    renditions: list = field(default_factory=list)   # list[Rendition] (audio/subs)
 
 
 @dataclass
@@ -111,6 +119,11 @@ def is_master(text: str) -> bool:
     return "#EXT-X-STREAM-INF" in text
 
 
+def rewrite_media_uri(line: str, new_uri: str) -> str:
+    """Replace the URI="…" attribute of an #EXT-X-MEDIA line."""
+    return _URI_ATTR_RE.sub(f'URI="{new_uri}"', line)
+
+
 # --- master ----------------------------------------------------------------
 
 def parse_master(text: str, base_url: str) -> MasterPlaylist:
@@ -133,12 +146,16 @@ def parse_master(text: str, base_url: str) -> MasterPlaylist:
             i = j + 1
         elif not line.strip():
             i += 1
+        elif line.strip().startswith("#EXT-X-MEDIA") and "URI=" in line:
+            # Audio/subtitle rendition: capture its origin URI so we can mirror
+            # the rendition playlist through our own server (URI rewritten at
+            # render time). Keep the original line for faithful re-emit.
+            m = _URI_ATTR_RE.search(line)
+            origin_uri = urljoin(base_url, m.group(1)) if m else ""
+            master.renditions.append(Rendition(
+                idx=len(master.renditions), line=line.strip(), origin_uri=origin_uri))
+            i += 1
         else:
-            # Preserve verbatim. For EXT-X-MEDIA, absolutize its URI attribute.
-            if line.strip().startswith("#EXT-X-MEDIA") and "URI=" in line:
-                def _abs(m):
-                    return 'URI="' + urljoin(base_url, m.group(1)) + '"'
-                line = _URI_ATTR_RE.sub(_abs, line)
             master.other_lines.append(line.strip())
             i += 1
     return master
