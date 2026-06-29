@@ -205,6 +205,28 @@ video { width: 100%; background: #0b0e16; border-radius: 12px; display: block; }
 .api-group { margin-bottom: 10px; }
 .api-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .api-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.api-out { margin-top: 8px; }
-.api-out-head { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
-.api-out pre { margin: 0; max-height: 240px; overflow: auto; font-size: 11px; background: #0b0e16; color: #c8d2e6; padding: 10px; border-radius: 8px; }
+.api-out { margin-top: 10px; }
+.api-out-head { font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--muted); }
+/* Fixed-size box; long lines (e.g. SCTE35) scroll horizontally instead of
+   resizing the box or wrapping. */
+.api-out pre {
+  margin: 0; height: 280px; max-width: 100%; overflow: auto;
+  white-space: pre; font-size: 11.5px; line-height: 1.5;
+  background: #0b0e16; color: #c8d2e6; padding: 12px; border-radius: 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* --- left tabs (channels page) --- */
+.tabs-layout { display: grid; grid-template-columns: 220px 1fr; gap: 18px; align-items: start; }
+@media (max-width: 820px) { .tabs-layout { grid-template-columns: 1fr; } }
+.tabs-side { display: flex; flex-direction: column; gap: 6px; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 10px; box-shadow: var(--shadow); position: sticky; top: 16px; }
+.tab-btn { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: transparent; color: var(--text); border: 1px solid transparent; font-weight: 600; font-size: 14px; padding: 11px 12px; border-radius: 10px; }
+.tab-btn:hover { background: var(--surface-2); }
+.tab-btn.active { background: #eef3ff; color: var(--primary); border-color: #dbe6ff; }
+.tab-ic { width: 22px; text-align: center; opacity: .8; font-weight: 700; }
+.narrow-card { max-width: 560px; }
+
+.status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--success); flex: none; }
+.status-dot.stopped { background: var(--muted); }
+
+button.success { background: var(--success); color: #fff; }

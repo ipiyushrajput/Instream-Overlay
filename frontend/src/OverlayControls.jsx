@@ -14,7 +14,6 @@ export default function OverlayControls({ channelId, minLead, onChange, onLog })
   const [type, setType] = useState("lband");
   const [startIn, setStartIn] = useState(minLead || 24);
   const [duration, setDuration] = useState(30);
-  const [urlInput, setUrlInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef(null);
@@ -30,12 +29,6 @@ export default function OverlayControls({ channelId, minLead, onChange, onLog })
     if (!file) return;
     setErr("");
     try { setBusy(true); setImage(await api.uploadImage(file)); }
-    catch (e) { setErr(String(e)); } finally { setBusy(false); }
-  }
-  async function importUrl() {
-    if (!urlInput.trim()) return;
-    setErr("");
-    try { setBusy(true); setImage(await api.fromUrl(urlInput.trim())); }
     catch (e) { setErr(String(e)); } finally { setBusy(false); }
   }
   async function schedule() {
@@ -80,17 +73,13 @@ export default function OverlayControls({ channelId, minLead, onChange, onLog })
         ))}
       </div>
 
+      <span className="hint" style={{ display: "block", margin: "6px 0" }}>…or upload your own</span>
       <div className="dropzone" onClick={() => fileRef.current?.click()}
            onDragOver={(e) => e.preventDefault()}
            onDrop={(e) => { e.preventDefault(); handleFile(e.dataTransfer.files?.[0]); }}>
         {image ? "Replace overlay image…" : "Click or drop a PNG (with transparency)"}
         <input ref={fileRef} type="file" accept="image/*" hidden
                onChange={(e) => handleFile(e.target.files?.[0])} />
-      </div>
-      <div className="url-row">
-        <input value={urlInput} onChange={(e) => setUrlInput(e.target.value)}
-               placeholder="…or paste an image URL" />
-        <button className="ghost small" onClick={importUrl} disabled={busy}>Import</button>
       </div>
       {imgSrc && <div className="preview"><img src={imgSrc} alt="overlay" /><code>{image.image_filename}</code></div>}
 
