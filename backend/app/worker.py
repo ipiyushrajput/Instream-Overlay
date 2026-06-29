@@ -39,9 +39,8 @@ class Job:
     overlay_image: str
     vp: VideoParams
     overlay_type: str
-    x_frac: float
-    y_frac: float
-    scale_frac: float
+    offset: float        # this segment's start time within the overlay event
+    duration: float      # total overlay-event duration (for the squeeze easing)
 
     @property
     def key(self) -> tuple:
@@ -126,7 +125,7 @@ class TranscodePool:
                 out = _out_path(*job.key)
                 ok, err = await transcode_segment(
                     job.origin_url, job.overlay_image, job.vp, job.overlay_type,
-                    job.x_frac, job.y_frac, job.scale_frac, out)
+                    job.offset, job.duration, out)
                 ms = int((time.monotonic() - started) * 1000)
                 if ok:
                     self._status[job.key] = JobStatus.READY
