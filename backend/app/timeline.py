@@ -30,6 +30,7 @@ class Decision:
     overlay_id: Optional[str]
     disc_native: bool             # origin had an EXT-X-DISCONTINUITY here
     disc_injected: bool           # origin<->overlay boundary we introduced
+    tags: list = field(default_factory=list)  # verbatim per-segment passthrough tags
 
 
 # decide() returns one of:
@@ -55,14 +56,19 @@ class VariantTimeline:
                 self.scrolled_injected += 1
 
     def advance(self, segments: list[MediaSegment], buffer_segments: int,
-                decide: DecideFn, max_wait: float = 25.0) -> None:
-        """Freeze new decisions up to ``origin_last - buffer_segments``.
+                decide: DecideFn, window_size: int, max_wait: float = 25.0) -> None:
+        """Freeze new decisions up to ``origin_last - buffer_segments`` and keep
+        the last ``window_size`` of them in history.
 
         Stops advancing at the first covered-but-not-ready segment (so the live
         edge waits for the transcode instead of publishing an origin segment we
         would later want to replace). After ``max_wait`` seconds we give up on
         that segment and freeze it as origin, so a failed transcode can't stall
         the edge forever.
+
+        We retain ``window_size`` segments of history (not just origin's current
+        window) so the output can mirror the origin's full window length even
+        though our live edge is held ``buffer_segments`` behind it.
         """
         if not segments:
             return
@@ -92,17 +98,20 @@ class VariantTimeline:
                 seq=seg.seq, uri=uri, duration=seg.duration, pdt=seg.pdt,
                 kind=kind, overlay_id=overlay_id,
                 disc_native=seg.discontinuity_before,
-                disc_injected=(kind != self.prev_kind))
+                disc_injected=(kind != self.prev_kind),
+                tags=list(seg.tags))
             self.prev_kind = kind
             self.max_frozen_seq = seg.seq
             s += 1
 
-        self._prune_below(origin_first)
+        # Keep a full window of history behind the held-back edge.
+        render_low = max(0, self.max_frozen_seq - max(1, window_size) + 1)
+        self._prune_below(render_low)
 
     def render(self, origin_base_disc_seq: int, target_duration: int,
-               version: int = 3, header_tags: Optional[list] = None) -> MediaPlaylist:
+               version: int = 3, header_extra: Optional[list] = None) -> MediaPlaylist:
         pl = MediaPlaylist(version=version, target_duration=target_duration)
-        pl.header_tags = header_tags or []
+        pl.header_extra = header_extra or []
         seqs = sorted(self.frozen)
         if not seqs:
             pl.media_sequence = max(0, self.max_frozen_seq + 1)
@@ -116,7 +125,8 @@ class VariantTimeline:
         pl.media_sequence = low
         for i, sq in enumerate(seqs):
             d = self.frozen[sq]
-            seg = MediaSegment(uri=d.uri, duration=d.duration, seq=d.seq, pdt=d.pdt)
+            seg = MediaSegment(uri=d.uri, duration=d.duration, seq=d.seq,
+                               pdt=d.pdt, tags=list(d.tags))
             # Fold the first segment's leading discontinuity into disc-sequence;
             # emit tags for all later boundaries (native or injected).
             seg.discontinuity_before = (i > 0) and (d.disc_native or d.disc_injected)

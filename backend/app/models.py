@@ -10,10 +10,9 @@ from pydantic import BaseModel, Field
 
 class OverlayType(str, Enum):
     LBAND = "lband"
-    LOWER_THIRD = "lower_third"
-    TOP_BANNER = "top_banner"
-    FULL_FRAME = "full_frame"
-    CUSTOM = "custom"
+    TOP_BAND = "top_band"
+    BOTTOM_BAND = "bottom_band"
+    PIP = "pip"
 
 
 class VariantInfo(BaseModel):
@@ -32,6 +31,7 @@ class VariantInfo(BaseModel):
     level: Optional[float] = None
     pix_fmt: str = "yuv420p"
     bitrate_kbps: Optional[int] = None
+    has_audio: bool = True
 
 
 class Channel(BaseModel):
@@ -39,6 +39,9 @@ class Channel(BaseModel):
     name: str
     master_url: str
     variants: list[VariantInfo] = Field(default_factory=list)
+    # Verbatim master-level lines (EXT-X-INDEPENDENT-SEGMENTS, EXT-X-MEDIA audio/
+    # subtitle renditions, etc.) preserved so the output master mirrors the origin.
+    master_other_lines: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -66,6 +69,11 @@ class OverlayEvent(BaseModel):
 class IngestRequest(BaseModel):
     master_url: str
     name: Optional[str] = None
+
+
+class UpdateChannelRequest(BaseModel):
+    name: Optional[str] = None
+    master_url: Optional[str] = None  # changing this re-probes the variants
 
 
 class CreateOverlayRequest(BaseModel):

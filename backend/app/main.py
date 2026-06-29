@@ -14,10 +14,10 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from . import config, manifest
+from . import config, db, defaults, manifest
 from .codecs import video_params_from_variant
 from .models import (Channel, CreateOverlayRelativeRequest, CreateOverlayRequest,
-                     IngestRequest, OverlayEvent, VariantInfo)
+                     IngestRequest, OverlayEvent, UpdateChannelRequest, VariantInfo)
 from .store import new_id, store
 from .timeline import VariantTimeline
 from .transcode import variant_video_params
@@ -101,12 +101,11 @@ def _overlay_status(overlay: OverlayEvent, edge: Optional[datetime]) -> str:
 
 
 def _min_lead_seconds(target_duration: int) -> int:
-    """Minimum lead before an overlay window starts. The transcode headroom is
-    already the buffer depth (segments are transcoded while held back), so the
-    lead only needs to push the window just past the current live edge. Two
-    segment durations gives comfortable margin (~10-12s)."""
+    """Minimum lead before an overlay window starts. Must cover the buffer
+    hold-back (where transcoding happens) plus margin. The squeeze + codec-match
+    (HEVC) encode is heavier, so we use (buffer + 1) segment durations."""
     td = target_duration or 6
-    return int(2 * td)
+    return int((config.BUFFER_SEGMENTS + 1) * td)
 
 
 log = logging.getLogger("overlay.api")
@@ -119,6 +118,9 @@ async def lifespan(app: FastAPI):
     log.info("starting up: buffer=%d segs, workers=%d, verify_tls=%s, data=%s",
              config.BUFFER_SEGMENTS, config.MAX_TRANSCODE_WORKERS,
              config.VERIFY_TLS, config.DATA_DIR)
+    db.init()
+    store.load_from_db()
+    defaults.ensure_default_overlays()
     app.state.http = httpx.AsyncClient(timeout=config.ORIGIN_TIMEOUT,
                                        follow_redirects=True,
                                        verify=config.VERIFY_TLS)
@@ -175,6 +177,28 @@ async def _fetch_text(url: str) -> str:
 
 # --- ingest ----------------------------------------------------------------
 
+def _probe_master(text: str, master_url: str) -> tuple[list[VariantInfo], list[str]]:
+    """Parse a master playlist into VariantInfos + preserved header lines."""
+    if not manifest.is_master(text):
+        return ([VariantInfo(index=0, origin_uri=master_url,
+                             inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")], [])
+    master = manifest.parse_master(text, master_url)
+    if not master.variants:
+        raise HTTPException(400, "No variants found in master playlist")
+    variants = []
+    for idx, mv in enumerate(master.variants):
+        vp = video_params_from_variant(mv.codecs, mv.resolution,
+                                       mv.frame_rate, mv.bandwidth)
+        variants.append(VariantInfo(
+            index=idx, origin_uri=mv.uri, inf_line=mv.inf_line,
+            codecs=mv.codecs, resolution=mv.resolution,
+            frame_rate=mv.frame_rate, bandwidth=mv.bandwidth,
+            width=vp.width, height=vp.height, fps=vp.fps,
+            profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
+            bitrate_kbps=vp.bitrate_kbps, has_audio=vp.has_audio))
+    return (variants, master.other_lines)
+
+
 @app.post("/api/ingest", response_model=Channel)
 async def ingest(req: IngestRequest):
     try:
@@ -182,28 +206,10 @@ async def ingest(req: IngestRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Failed to fetch master: {exc}")
 
-    if not manifest.is_master(text):
-        # Single-variant playlist: synthesize one variant pointing at it.
-        variants = [VariantInfo(index=0, origin_uri=req.master_url,
-                                inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")]
-    else:
-        parsed = manifest.parse_master(text, req.master_url)
-        if not parsed:
-            raise HTTPException(400, "No variants found in master playlist")
-        variants = []
-        for idx, mv in enumerate(parsed):
-            vp = video_params_from_variant(mv.codecs, mv.resolution,
-                                           mv.frame_rate, mv.bandwidth)
-            variants.append(VariantInfo(
-                index=idx, origin_uri=mv.uri, inf_line=mv.inf_line,
-                codecs=mv.codecs, resolution=mv.resolution,
-                frame_rate=mv.frame_rate, bandwidth=mv.bandwidth,
-                width=vp.width, height=vp.height, fps=vp.fps,
-                profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
-                bitrate_kbps=vp.bitrate_kbps))
-
+    variants, master_other_lines = _probe_master(text, req.master_url)
     channel = Channel(id=new_id(), name=req.name or "channel",
-                      master_url=req.master_url, variants=variants)
+                      master_url=req.master_url, variants=variants,
+                      master_other_lines=master_other_lines)
     store.add_channel(channel)
     log.info("ingested channel=%s master=%s variants=%d", channel.id,
              req.master_url, len(variants))
@@ -224,6 +230,29 @@ async def get_channel(channel_id: str):
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
+    return ch
+
+
+@app.put("/api/channels/{channel_id}", response_model=Channel)
+async def update_channel(channel_id: str, req: UpdateChannelRequest):
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    if req.name is not None:
+        ch.name = req.name
+    if req.master_url is not None and req.master_url != ch.master_url:
+        # Re-probe the variants from the new origin and reset timelines.
+        try:
+            text = await _fetch_text(req.master_url)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"Failed to fetch master: {exc}")
+        variants, other = _probe_master(text, req.master_url)
+        ch.master_url = req.master_url
+        ch.variants = variants
+        ch.master_other_lines = other
+        _drop_timelines(channel_id)
+    store.update_channel(ch)
+    log.info("updated channel=%s name=%s", channel_id, ch.name)
     return ch
 
 
@@ -254,12 +283,36 @@ async def channel_status(channel_id: str):
 
 # --- overlays --------------------------------------------------------------
 
+@app.get("/api/defaults")
+async def list_default_overlays():
+    """Built-in overlay band presets (item 7) — no upload needed."""
+    return defaults.list_defaults()
+
+
 @app.post("/api/overlays/upload")
 async def upload_overlay(file: UploadFile = File(...)):
     config.ensure_dirs()
     name = f"{new_id()}_{Path(file.filename or 'overlay.png').name}"
     dest = config.UPLOAD_DIR / name
     dest.write_bytes(await file.read())
+    return {"image_filename": name, "url": f"{config.PUBLIC_BASE_URL}/uploads/{name}"}
+
+
+@app.post("/api/overlays/from-url")
+async def overlay_from_url(payload: dict):
+    """Import an overlay image from a URL the user provides (item 7)."""
+    url = (payload or {}).get("url", "").strip()
+    if not url:
+        raise HTTPException(400, "url required")
+    try:
+        resp = await app.state.http.get(url)
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"failed to fetch image: {exc}")
+    config.ensure_dirs()
+    ext = Path(url.split("?")[0]).suffix or ".png"
+    name = f"{new_id()}{ext}"
+    (config.UPLOAD_DIR / name).write_bytes(resp.content)
     return {"image_filename": name, "url": f"{config.PUBLIC_BASE_URL}/uploads/{name}"}
 
 
@@ -382,7 +435,12 @@ async def serve_master(channel_id: str):
         raise HTTPException(404, "channel not found")
     session = new_id()
     started = int(datetime.now(timezone.utc).timestamp() * 1000)
-    out = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    # Preserve the origin master's header lines (EXT-X-INDEPENDENT-SEGMENTS,
+    # EXT-X-MEDIA audio/subtitle renditions, …); fall back to a minimal header.
+    out = list(ch.master_other_lines) if ch.master_other_lines else \
+        ["#EXTM3U", "#EXT-X-VERSION:3"]
+    if not out or out[0] != "#EXTM3U":
+        out.insert(0, "#EXTM3U")
     for v in ch.variants:
         w = v.width or ""
         h = v.height or ""
@@ -421,13 +479,17 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
         return None
 
     def make_job(seg, overlay: OverlayEvent) -> Job:
+        seg_pdt = _parse_pdt(seg.pdt)
+        offset = 0.0
+        if seg_pdt is not None:
+            offset = max(0.0, (seg_pdt - overlay.start_pdt).total_seconds())
+        duration = (overlay.end_pdt - overlay.start_pdt).total_seconds()
         return Job(
             channel_id=channel_id, variant_index=variant_index,
             overlay_id=overlay.id, seq=seg.seq, origin_url=seg.uri,
             overlay_image=str(config.UPLOAD_DIR / overlay.image_filename),
             vp=vp, overlay_type=overlay.overlay_type.value,
-            x_frac=overlay.x_frac, y_frac=overlay.y_frac,
-            scale_frac=overlay.scale_frac)
+            offset=offset, duration=duration)
 
     # Look-ahead: kick off transcodes for EVERY covered segment in the full
     # origin window (including the buffered tail) so they're ready before the
@@ -452,9 +514,11 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
         return None  # pending -> hold the edge here until it's ready
 
     before_max = tl.max_frozen_seq
-    tl.advance(pl.segments, config.BUFFER_SEGMENTS, decide)
+    # Mirror the origin's window length so the output isn't shorter than origin.
+    window_size = len(pl.segments) or 1
+    tl.advance(pl.segments, config.BUFFER_SEGMENTS, decide, window_size)
     out = tl.render(pl.discontinuity_sequence, pl.target_duration,
-                    version=pl.version, header_tags=pl.header_tags)
+                    version=pl.version, header_extra=pl.header_extra)
 
     if overlays and tl.max_frozen_seq != before_max:
         n_overlay = sum(1 for d in tl.frozen.values() if d.kind == "overlay")

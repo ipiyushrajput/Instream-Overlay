@@ -16,6 +16,10 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 ffmpeg -version | head -1
 
+echo ">> MySQL: ensure a server is reachable with your DB_* creds."
+echo "   (channels persist to MySQL; the app falls back to in-memory if absent.)"
+echo "   On Debian/Ubuntu: sudo apt-get install -y mariadb-server"
+
 echo ">> Python backend deps…"
 cd "$ROOT/backend"
 python3 -m venv .venv
