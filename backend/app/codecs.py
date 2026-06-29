@@ -27,7 +27,7 @@ _AVC_PROFILE = {
 @dataclass
 class VideoParams:
     """Everything we need to reproduce a variant's video encode."""
-    codec: str = "h264"          # ffmpeg encoder family
+    codec: str = "h264"          # 'h264' | 'hevc'
     profile: Optional[str] = None  # e.g. "high"
     level: Optional[float] = None  # e.g. 3.1
     width: Optional[int] = None
@@ -35,6 +35,7 @@ class VideoParams:
     fps: Optional[float] = None
     pix_fmt: str = "yuv420p"
     bitrate_kbps: Optional[int] = None
+    has_audio: bool = True        # audio stream present in the segments
 
     @property
     def x264_level(self) -> Optional[str]:
@@ -49,7 +50,7 @@ def parse_codecs_attr(codecs: str) -> VideoParams:
     AVCProfileIndication(2) + profile_compatibility(2) + AVCLevelIndication(2),
     so ``64101f`` -> profile_idc=0x64=100 (High), level_idc=0x1f=31 -> 3.1.
     """
-    params = VideoParams()
+    params = VideoParams(has_audio=False)
     for token in (codecs or "").split(","):
         token = token.strip().strip('"')
         if token.startswith("avc1") or token.startswith("avc3"):
@@ -66,6 +67,13 @@ def parse_codecs_attr(codecs: str) -> VideoParams:
                     pass
         elif token.startswith("hvc1") or token.startswith("hev1"):
             params.codec = "hevc"
+            # hvcC form: hvc1.<profile>.<compat>.L<level>.<constraints>
+            parts = token.split(".")
+            for p in parts:
+                if p.startswith("L") and p[1:].isdigit():
+                    params.level = int(p[1:]) / 30.0  # HEVC level = general_level_idc/30
+        elif token.startswith(("mp4a", "ac-3", "ec-3", "opus", "aac")):
+            params.has_audio = True
     return params
 
 
@@ -92,40 +100,72 @@ def video_params_from_variant(codecs: str, resolution: Optional[str],
 
 # --- Overlay placement -----------------------------------------------------
 
-# Overlay types map to a (scale_expr, x_expr, y_expr) recipe evaluated against
-# the variant's pixel dimensions. W/H are numeric main dimensions; overlay_w /
-# overlay_h are the scaled overlay's own dimensions (resolved by ffmpeg).
-OVERLAY_TYPES = {"lband", "lower_third", "top_banner", "full_frame", "custom"}
+# The four squeeze-back overlay types. Each defines the "pocket" the main video
+# is squeezed into, as fractions of the full frame: (frac_w, frac_h, frac_x,
+# frac_y), derived from the user's 1920x1080 spec and applied to any variant
+# resolution. ``pip`` layers the ad/full image BEHIND the (shrunken) video.
+OVERLAY_TYPES = {"lband", "top_band", "bottom_band", "pip"}
+
+POCKETS = {
+    # video squeezes to top-right; band art fills the freed left/bottom area.
+    "lband":       (1460 / 1920, 780 / 1080, 460 / 1920, 0.0),
+    # video pushed down; band art across the top.
+    "top_band":    (1.0,         930 / 1080, 0.0,         150 / 1080),
+    # video pushed up; band art across the bottom.
+    "bottom_band": (1.0,         840 / 1080, 0.0,         0.0),
+    # video shrinks into a PIP window; ad art fills the rest (behind).
+    "pip":         (820 / 1920,  460 / 1080, 1010 / 1920, 310 / 1080),
+}
 
 
-def build_overlay_filter(vp: VideoParams, overlay_type: str,
-                         x_frac: float = 0.0, y_frac: float = 0.0,
-                         scale_frac: float = 1.0) -> str:
-    """Return an ffmpeg ``-filter_complex`` graph that burns input #1 (the
-    overlay image) onto input #0 (the video), scaled for this variant.
+def _smoothstep_expr(duration: float, offset: float, t_in: float, t_out: float) -> str:
+    """Eased squeeze factor e(g) in [0,1]: ramps 0->1 over [0,t_in], holds, then
+    1->0 over [duration-t_out, duration]. ``g = t + offset`` is event-global time
+    (``t`` is the segment-local frame time; ``offset`` is the segment's position
+    within the event), so the animation is continuous across the event's
+    segments without shifting the actual compositing timeline."""
+    d_off = max(0.0, duration - t_out)
+    g = f"(t+{offset:.4f})"
+    s = (f"(clip({g}/{t_in:.3f},0,1)*"
+         f"(1-clip(({g}-{d_off:.3f})/{t_out:.3f},0,1)))")
+    return f"({s}*{s}*(3-2*{s}))"  # smoothstep
 
-    Input pads: ``[0:v]`` video, ``[1:v]`` overlay image. Output pad: ``[v]``.
+
+def build_squeeze_filter(vp: VideoParams, overlay_type: str, offset: float,
+                         duration: float, t_in: float = 0.6, t_out: float = 0.6) -> str:
+    """ffmpeg ``-filter_complex`` that squeezes the main video (input #0) into
+    the overlay pocket and composites the overlay/ad art (input #1), animated by
+    the eased factor e(t). ``offset`` is this segment's start time within the
+    event (so the animation is continuous across the event's segments).
+
+    Input pads: ``[0:v]`` video, ``[1:v]`` overlay image. Output pad: ``[outv]``.
     """
     W = vp.width or 1280
     H = vp.height or 720
+    fw, fh, fx, fy = POCKETS.get(overlay_type, POCKETS["lband"])
+    Wt = max(2, round(W * fw))
+    Ht = max(2, round(H * fh))
+    Xt = round(W * fx)
+    Yt = round(H * fy)
+    E = _smoothstep_expr(duration, offset, t_in, t_out)
 
-    if overlay_type == "full_frame":
-        scale = f"scale={W}:{H}"
-        x, y = "0", "0"
-    elif overlay_type == "top_banner":
-        scale = f"scale={W}:-2"
-        x, y = "0", "0"
-    elif overlay_type == "lower_third":
-        scale = f"scale={W}:-2"
-        x, y = "0", f"{int(H * 2 / 3)}"
-    elif overlay_type == "custom":
-        sw = max(2, int(W * scale_frac))
-        scale = f"scale={sw}:-2"
-        # x_frac/y_frac in [0,1] position the overlay within the free space.
-        x = f"(main_w-overlay_w)*{x_frac:.4f}"
-        y = f"(main_h-overlay_h)*{y_frac:.4f}"
-    else:  # "lband" default: full-width band pinned to the bottom edge.
-        scale = f"scale={W}:-2"
-        x, y = "0", "main_h-overlay_h"
+    # Keep the segment 0-based and aligned with the bg/art (no compositing gap);
+    # cross-segment continuity is handled by -output_ts_offset at mux time.
+    pts = "setpts=PTS-STARTPTS"
+    wexpr = f"floor(({W}-({E})*({W}-{Wt}))/2)*2"
+    hexpr = f"floor(({H}-({E})*({H}-{Ht}))/2)*2"
+    xexpr = f"({E})*{Xt}"
+    yexpr = f"({E})*{Yt}"
+    fps = vp.fps or 30
 
-    return f"[1:v]{scale}[ov];[0:v][ov]overlay={x}:{y}[v]"
+    v = (f"[0:v]{pts},scale=w='{wexpr}':h='{hexpr}':eval=frame,setsar=1[v]")
+    bg = f"color=c=black:s={W}x{H}:r={fps:g}[bg]"
+    art = f"[1:v]scale={W}:{H},format=rgba[art]"
+
+    if overlay_type == "pip":
+        # Ad art behind, shrunken video on top.
+        return (f"{v};{bg};{art};[bg][art]overlay=0:0:shortest=1[base];"
+                f"[base][v]overlay=x='{xexpr}':y='{yexpr}':eval=frame:shortest=1[outv]")
+    # Bands: video on black, band art on top (its transparent center reveals video).
+    return (f"{v};{bg};{art};[bg][v]overlay=x='{xexpr}':y='{yexpr}':eval=frame:shortest=1[m];"
+            f"[m][art]overlay=0:0:eval=frame:shortest=1[outv]")

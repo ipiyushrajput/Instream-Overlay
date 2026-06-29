@@ -101,12 +101,11 @@ def _overlay_status(overlay: OverlayEvent, edge: Optional[datetime]) -> str:
 
 
 def _min_lead_seconds(target_duration: int) -> int:
-    """Minimum lead before an overlay window starts. The transcode headroom is
-    already the buffer depth (segments are transcoded while held back), so the
-    lead only needs to push the window just past the current live edge. Two
-    segment durations gives comfortable margin (~10-12s)."""
+    """Minimum lead before an overlay window starts. Must cover the buffer
+    hold-back (where transcoding happens) plus margin. The squeeze + codec-match
+    (HEVC) encode is heavier, so we use (buffer + 1) segment durations."""
     td = target_duration or 6
-    return int(2 * td)
+    return int((config.BUFFER_SEGMENTS + 1) * td)
 
 
 log = logging.getLogger("overlay.api")
@@ -202,7 +201,7 @@ async def ingest(req: IngestRequest):
                 frame_rate=mv.frame_rate, bandwidth=mv.bandwidth,
                 width=vp.width, height=vp.height, fps=vp.fps,
                 profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
-                bitrate_kbps=vp.bitrate_kbps))
+                bitrate_kbps=vp.bitrate_kbps, has_audio=vp.has_audio))
 
     channel = Channel(id=new_id(), name=req.name or "channel",
                       master_url=req.master_url, variants=variants,
@@ -429,13 +428,17 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
         return None
 
     def make_job(seg, overlay: OverlayEvent) -> Job:
+        seg_pdt = _parse_pdt(seg.pdt)
+        offset = 0.0
+        if seg_pdt is not None:
+            offset = max(0.0, (seg_pdt - overlay.start_pdt).total_seconds())
+        duration = (overlay.end_pdt - overlay.start_pdt).total_seconds()
         return Job(
             channel_id=channel_id, variant_index=variant_index,
             overlay_id=overlay.id, seq=seg.seq, origin_url=seg.uri,
             overlay_image=str(config.UPLOAD_DIR / overlay.image_filename),
             vp=vp, overlay_type=overlay.overlay_type.value,
-            x_frac=overlay.x_frac, y_frac=overlay.y_frac,
-            scale_frac=overlay.scale_frac)
+            offset=offset, duration=duration)
 
     # Look-ahead: kick off transcodes for EVERY covered segment in the full
     # origin window (including the buffered tail) so they're ready before the

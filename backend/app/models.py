@@ -10,10 +10,9 @@ from pydantic import BaseModel, Field
 
 class OverlayType(str, Enum):
     LBAND = "lband"
-    LOWER_THIRD = "lower_third"
-    TOP_BANNER = "top_banner"
-    FULL_FRAME = "full_frame"
-    CUSTOM = "custom"
+    TOP_BAND = "top_band"
+    BOTTOM_BAND = "bottom_band"
+    PIP = "pip"
 
 
 class VariantInfo(BaseModel):
@@ -32,6 +31,7 @@ class VariantInfo(BaseModel):
     level: Optional[float] = None
     pix_fmt: str = "yuv420p"
     bitrate_kbps: Optional[int] = None
+    has_audio: bool = True
 
 
 class Channel(BaseModel):
