@@ -39,9 +39,13 @@ class Channel(BaseModel):
     name: str
     master_url: str
     variants: list[VariantInfo] = Field(default_factory=list)
-    # Verbatim master-level lines (EXT-X-INDEPENDENT-SEGMENTS, EXT-X-MEDIA audio/
-    # subtitle renditions, etc.) preserved so the output master mirrors the origin.
+    # Verbatim master-level lines (EXT-X-INDEPENDENT-SEGMENTS, etc.) preserved so
+    # the output master mirrors the origin.
     master_other_lines: list[str] = Field(default_factory=list)
+    # Audio/subtitle renditions (EXT-X-MEDIA): {idx, line, origin_uri}. Mirrored
+    # through our /rendition endpoint with segments absolutized to origin.
+    renditions: list[dict] = Field(default_factory=list)
+    status: str = "active"   # "active" | "stopped"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
