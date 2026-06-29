@@ -1,9 +1,8 @@
 import React, { useState } from "react";
 import { api } from "./api.js";
 
-// Lets the operator call every endpoint and inspect the JSON. Common endpoints
-// are always available; channel-specific ones are passed a channelId.
-export default function ApiExplorer({ channelId }) {
+// mode="common" -> common APIs (main page); mode="channel" -> channel-specific.
+export default function ApiExplorer({ mode = "common", channelId }) {
   const [out, setOut] = useState(null);
   const [title, setTitle] = useState("");
   const [busy, setBusy] = useState(false);
@@ -16,42 +15,30 @@ export default function ApiExplorer({ channelId }) {
   }
 
   const common = [
-    ["GET /api/health", () => api.health()],
-    ["GET /api/channels", () => api.listChannels()],
-    ["GET /api/defaults", () => api.defaults()],
+    ["All Channel Status", () => api.health()],
+    ["All Channel Details", () => api.listChannels()],
+    ["Defaults", () => api.defaults()],
   ];
   const channel = channelId ? [
-    ["GET /api/channels/{id}", () => api.getChannel(channelId)],
-    ["GET …/status", () => api.channelStatus(channelId)],
-    ["GET …/overlays", () => api.listOverlays(channelId)],
-    ["GET …/debug (v0)", () => api.channelDebug(channelId, 0)],
+    ["Channel data", () => api.getChannel(channelId)],
+    ["Channel Status", () => api.channelStatus(channelId)],
+    ["Overlays", () => api.listOverlays(channelId)],
+    ["Debug", () => api.channelDebug(channelId, 0)],
   ] : [];
+  const buttons = mode === "channel" ? channel : common;
 
   return (
     <div className="card">
       <h3>API explorer</h3>
-      <div className="api-group"><span className="api-label">Common</span>
-        <div className="api-btns">
-          {common.map(([l, fn]) => (
-            <button key={l} className="ghost small" onClick={() => call(l, fn)}>{l}</button>
-          ))}
-        </div>
+      <div className="api-btns">
+        {buttons.map(([l, fn]) => (
+          <button key={l} className="ghost small" onClick={() => call(l, fn)}>{l}</button>
+        ))}
       </div>
-      {channelId && (
-        <div className="api-group"><span className="api-label">This channel</span>
-          <div className="api-btns">
-            {channel.map(([l, fn]) => (
-              <button key={l} className="ghost small" onClick={() => call(l, fn)}>{l}</button>
-            ))}
-          </div>
-        </div>
-      )}
-      {title && (
-        <div className="api-out">
-          <div className="api-out-head">{busy ? "Loading…" : title}</div>
-          <pre>{out ? JSON.stringify(out, null, 2) : ""}</pre>
-        </div>
-      )}
+      <div className="api-out">
+        <div className="api-out-head">{busy ? "Loading…" : (title || "Pick an endpoint above")}</div>
+        <pre>{out ? JSON.stringify(out, null, 2) : ""}</pre>
+      </div>
     </div>
   );
 }

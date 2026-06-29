@@ -52,12 +52,21 @@ export default function ChannelConsole() {
   }, [id]);
 
   async function stop() {
-    await api.stopChannel(id).catch(() => {});
+    const ch = await api.stopChannel(id).catch(() => null);
+    if (ch) setChannel(ch);
+  }
+  async function start() {
+    const ch = await api.startChannel(id).catch(() => null);
+    if (ch) setChannel(ch);
+  }
+  async function del() {
+    await api.deleteChannel(id).catch(() => {});
     nav("/");
   }
 
   if (!channel) return <div className="card">Loading…</div>;
-  const liveOn = !!status?.live_edge_pdt;
+  const stopped = channel.status === "stopped";
+  const liveOn = !stopped && !!status?.live_edge_pdt;
 
   return (
     <div>
@@ -67,8 +76,12 @@ export default function ChannelConsole() {
           <div className="hint">{channel.master_url}</div>
         </div>
         <div className="head-actions">
-          <span className={`live-pill ${liveOn ? "on" : ""}`}><span className="dot" />{liveOn ? "LIVE" : "idle"}</span>
-          <button className="danger" onClick={stop}>Stop ingestion</button>
+          <span className={`live-pill ${liveOn ? "on" : ""}`}>
+            <span className="dot" />{stopped ? "STOPPED" : (liveOn ? "LIVE" : "idle")}</span>
+          {stopped
+            ? <button className="success" onClick={start}>Start ingestion</button>
+            : <button className="ghost" onClick={stop}>Stop ingestion</button>}
+          <button className="danger" onClick={del}>Delete</button>
         </div>
       </div>
 
@@ -115,7 +128,7 @@ export default function ChannelConsole() {
               ))}
             </ul>
           </div>
-          <ApiExplorer channelId={id} />
+          <ApiExplorer mode="channel" channelId={id} />
         </div>
         <div className="right">
           <OverlayControls channelId={id} minLead={status?.min_lead_seconds || 24}
