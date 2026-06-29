@@ -60,6 +60,23 @@ SQUEEZE_OUT = float(os.environ.get("OVERLAY_SQUEEZE_OUT", "0.6"))
 VERIFY_TLS = os.environ.get("OVERLAY_VERIFY_TLS", "0") not in ("0", "false", "False", "")
 
 
+# --- MySQL ----------------------------------------------------------------
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = _int("DB_PORT", 3306)
+DB_USER = os.environ.get("DB_USER", "root")
+DB_PASS = os.environ.get("DB_PASS", "Piyush@23")
+DB_NAME = os.environ.get("DB_NAME", "instream_overlay")
+# Set DB_ENABLED=0 to run purely in-memory (no MySQL required).
+DB_ENABLED = os.environ.get("DB_ENABLED", "1") not in ("0", "false", "False", "")
+
+
+def db_url(include_db: bool = True) -> str:
+    from urllib.parse import quote_plus
+    auth = f"{quote_plus(DB_USER)}:{quote_plus(DB_PASS)}"
+    base = f"mysql+pymysql://{auth}@{DB_HOST}:{DB_PORT}"
+    return f"{base}/{DB_NAME}" if include_db else base
+
+
 LOG_LEVEL = os.environ.get("OVERLAY_LOG_LEVEL", "INFO").upper()
 # Logs live in <repo>/logs by default (sibling of backend/ and frontend/).
 LOG_DIR = Path(os.environ.get("OVERLAY_LOG_DIR", REPO_ROOT / "logs"))

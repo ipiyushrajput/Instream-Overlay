@@ -14,10 +14,10 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from . import config, manifest
+from . import config, db, manifest
 from .codecs import video_params_from_variant
 from .models import (Channel, CreateOverlayRelativeRequest, CreateOverlayRequest,
-                     IngestRequest, OverlayEvent, VariantInfo)
+                     IngestRequest, OverlayEvent, UpdateChannelRequest, VariantInfo)
 from .store import new_id, store
 from .timeline import VariantTimeline
 from .transcode import variant_video_params
@@ -118,6 +118,8 @@ async def lifespan(app: FastAPI):
     log.info("starting up: buffer=%d segs, workers=%d, verify_tls=%s, data=%s",
              config.BUFFER_SEGMENTS, config.MAX_TRANSCODE_WORKERS,
              config.VERIFY_TLS, config.DATA_DIR)
+    db.init()
+    store.load_from_db()
     app.state.http = httpx.AsyncClient(timeout=config.ORIGIN_TIMEOUT,
                                        follow_redirects=True,
                                        verify=config.VERIFY_TLS)
@@ -174,6 +176,28 @@ async def _fetch_text(url: str) -> str:
 
 # --- ingest ----------------------------------------------------------------
 
+def _probe_master(text: str, master_url: str) -> tuple[list[VariantInfo], list[str]]:
+    """Parse a master playlist into VariantInfos + preserved header lines."""
+    if not manifest.is_master(text):
+        return ([VariantInfo(index=0, origin_uri=master_url,
+                             inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")], [])
+    master = manifest.parse_master(text, master_url)
+    if not master.variants:
+        raise HTTPException(400, "No variants found in master playlist")
+    variants = []
+    for idx, mv in enumerate(master.variants):
+        vp = video_params_from_variant(mv.codecs, mv.resolution,
+                                       mv.frame_rate, mv.bandwidth)
+        variants.append(VariantInfo(
+            index=idx, origin_uri=mv.uri, inf_line=mv.inf_line,
+            codecs=mv.codecs, resolution=mv.resolution,
+            frame_rate=mv.frame_rate, bandwidth=mv.bandwidth,
+            width=vp.width, height=vp.height, fps=vp.fps,
+            profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
+            bitrate_kbps=vp.bitrate_kbps, has_audio=vp.has_audio))
+    return (variants, master.other_lines)
+
+
 @app.post("/api/ingest", response_model=Channel)
 async def ingest(req: IngestRequest):
     try:
@@ -181,28 +205,7 @@ async def ingest(req: IngestRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Failed to fetch master: {exc}")
 
-    master_other_lines: list[str] = []
-    if not manifest.is_master(text):
-        # Single-variant playlist: synthesize one variant pointing at it.
-        variants = [VariantInfo(index=0, origin_uri=req.master_url,
-                                inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")]
-    else:
-        master = manifest.parse_master(text, req.master_url)
-        if not master.variants:
-            raise HTTPException(400, "No variants found in master playlist")
-        master_other_lines = master.other_lines
-        variants = []
-        for idx, mv in enumerate(master.variants):
-            vp = video_params_from_variant(mv.codecs, mv.resolution,
-                                           mv.frame_rate, mv.bandwidth)
-            variants.append(VariantInfo(
-                index=idx, origin_uri=mv.uri, inf_line=mv.inf_line,
-                codecs=mv.codecs, resolution=mv.resolution,
-                frame_rate=mv.frame_rate, bandwidth=mv.bandwidth,
-                width=vp.width, height=vp.height, fps=vp.fps,
-                profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
-                bitrate_kbps=vp.bitrate_kbps, has_audio=vp.has_audio))
-
+    variants, master_other_lines = _probe_master(text, req.master_url)
     channel = Channel(id=new_id(), name=req.name or "channel",
                       master_url=req.master_url, variants=variants,
                       master_other_lines=master_other_lines)
@@ -226,6 +229,29 @@ async def get_channel(channel_id: str):
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
+    return ch
+
+
+@app.put("/api/channels/{channel_id}", response_model=Channel)
+async def update_channel(channel_id: str, req: UpdateChannelRequest):
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    if req.name is not None:
+        ch.name = req.name
+    if req.master_url is not None and req.master_url != ch.master_url:
+        # Re-probe the variants from the new origin and reset timelines.
+        try:
+            text = await _fetch_text(req.master_url)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"Failed to fetch master: {exc}")
+        variants, other = _probe_master(text, req.master_url)
+        ch.master_url = req.master_url
+        ch.variants = variants
+        ch.master_other_lines = other
+        _drop_timelines(channel_id)
+    store.update_channel(ch)
+    log.info("updated channel=%s name=%s", channel_id, ch.name)
     return ch
 
 
