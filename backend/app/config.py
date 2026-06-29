@@ -35,6 +35,9 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rst
 # processing headroom that lets the worker transcode overlay segments before a
 # player ever requests them. The user explicitly accepts this added delay.
 BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 3)
+# Extra hold-back segments when the origin is HEVC (libx265 encoding is heavier,
+# so it needs more lead time to avoid buffering during overlay transitions).
+HEVC_EXTRA_BUFFER = _int("OVERLAY_HEVC_EXTRA_BUFFER", 3)
 
 # Max concurrent ffmpeg transcodes.
 MAX_TRANSCODE_WORKERS = _int("OVERLAY_MAX_WORKERS", 4)

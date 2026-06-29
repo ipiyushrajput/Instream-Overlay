@@ -37,6 +37,50 @@ def _timeline(channel_id: str, variant_index: int) -> VariantTimeline:
 def _drop_timelines(channel_id: str) -> None:
     for key in [k for k in _timelines if k[0] == channel_id]:
         _timelines.pop(key, None)
+    _synth_pdt.pop(channel_id, None)
+
+
+# Per-channel synthesized PROGRAM-DATE-TIME (seq -> ISO) for origins that ship
+# no PDT at all. Assigned once per segment from the wall clock and reused so the
+# value is stable across reloads (required for playlist immutability).
+_synth_pdt: dict[str, dict[int, str]] = {}
+
+
+def _ensure_pdt(channel_id: str, pl) -> bool:
+    """Ensure every segment has a PDT. If the origin already provides one
+    (top-of-playlist or per-segment), the parser's forward-fill has it covered
+    and we do nothing. If there is none at all, synthesize from UTC wall clock,
+    anchored once per segment so it stays stable. Returns True if PDT is present
+    (native or synthesized)."""
+    if any(s.pdt for s in pl.segments):
+        return True
+    if not pl.segments:
+        return False
+    synth = _synth_pdt.setdefault(channel_id, {})
+    running = None
+    for seg in pl.segments:
+        if seg.seq in synth:
+            seg.pdt = synth[seg.seq]
+            running = _parse_pdt(seg.pdt)
+        else:
+            if running is None:
+                running = datetime.now(timezone.utc)
+            seg.pdt = running.isoformat()
+            synth[seg.seq] = seg.pdt
+        running = running + timedelta(seconds=seg.duration or 0.0)
+    # Prune entries below the current window.
+    window_min = pl.segments[0].seq
+    for s in [s for s in synth if s < window_min - 50]:
+        synth.pop(s, None)
+    return True
+
+
+async def _channel_media(channel_id: str, origin_uri: str):
+    """Fetch + parse a channel's origin media playlist, with PDT ensured."""
+    text = await _fetch_origin_cached(app.state.http, origin_uri)
+    pl = manifest.parse_media(text, origin_uri)
+    _ensure_pdt(channel_id, pl)
+    return pl
 
 
 # Short-TTL cache of origin manifests, shared across player + status requests so
@@ -100,12 +144,25 @@ def _overlay_status(overlay: OverlayEvent, edge: Optional[datetime]) -> str:
     return "completed" if injected else "expired"
 
 
-def _min_lead_seconds(target_duration: int) -> int:
+def _is_hevc(ch: Channel) -> bool:
+    return any((v.codecs or "").lower().startswith(("hvc1", "hev1")) for v in ch.variants)
+
+
+def _effective_buffer(ch: Channel) -> int:
+    """Segments to hold behind the live edge. HEVC software encoding is much
+    heavier than H.264, so we hold back more to give the transcoder headroom and
+    avoid the buffering/freezing seen during HEVC overlay transitions."""
+    base = config.BUFFER_SEGMENTS
+    return base + config.HEVC_EXTRA_BUFFER if _is_hevc(ch) else base
+
+
+def _min_lead_seconds(target_duration: int, ch: Optional[Channel] = None) -> int:
     """Minimum lead before an overlay window starts. Must cover the buffer
     hold-back (where transcoding happens) plus margin. The squeeze + codec-match
-    (HEVC) encode is heavier, so we use (buffer + 1) segment durations."""
+    (HEVC) encode is heavier, so the effective buffer is larger for HEVC."""
     td = target_duration or 6
-    return int((config.BUFFER_SEGMENTS + 1) * td)
+    buf = _effective_buffer(ch) if ch is not None else config.BUFFER_SEGMENTS
+    return int((buf + 1) * td)
 
 
 log = logging.getLogger("overlay.api")
@@ -177,11 +234,12 @@ async def _fetch_text(url: str) -> str:
 
 # --- ingest ----------------------------------------------------------------
 
-def _probe_master(text: str, master_url: str) -> tuple[list[VariantInfo], list[str]]:
-    """Parse a master playlist into VariantInfos + preserved header lines."""
+def _probe_master(text: str, master_url: str) -> tuple[list[VariantInfo], list[str], list[dict]]:
+    """Parse a master playlist into VariantInfos + preserved header lines +
+    audio/subtitle renditions."""
     if not manifest.is_master(text):
         return ([VariantInfo(index=0, origin_uri=master_url,
-                             inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")], [])
+                             inf_line="#EXT-X-STREAM-INF:BANDWIDTH=2000000")], [], [])
     master = manifest.parse_master(text, master_url)
     if not master.variants:
         raise HTTPException(400, "No variants found in master playlist")
@@ -196,7 +254,9 @@ def _probe_master(text: str, master_url: str) -> tuple[list[VariantInfo], list[s
             width=vp.width, height=vp.height, fps=vp.fps,
             profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
             bitrate_kbps=vp.bitrate_kbps, has_audio=vp.has_audio))
-    return (variants, master.other_lines)
+    renditions = [{"idx": r.idx, "line": r.line, "origin_uri": r.origin_uri}
+                  for r in master.renditions]
+    return (variants, master.other_lines, renditions)
 
 
 @app.post("/api/ingest", response_model=Channel)
@@ -206,10 +266,10 @@ async def ingest(req: IngestRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Failed to fetch master: {exc}")
 
-    variants, master_other_lines = _probe_master(text, req.master_url)
+    variants, master_other_lines, renditions = _probe_master(text, req.master_url)
     channel = Channel(id=new_id(), name=req.name or "channel",
                       master_url=req.master_url, variants=variants,
-                      master_other_lines=master_other_lines)
+                      master_other_lines=master_other_lines, renditions=renditions)
     store.add_channel(channel)
     log.info("ingested channel=%s master=%s variants=%d", channel.id,
              req.master_url, len(variants))
@@ -246,10 +306,11 @@ async def update_channel(channel_id: str, req: UpdateChannelRequest):
             text = await _fetch_text(req.master_url)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, f"Failed to fetch master: {exc}")
-        variants, other = _probe_master(text, req.master_url)
+        variants, other, renditions = _probe_master(text, req.master_url)
         ch.master_url = req.master_url
         ch.variants = variants
         ch.master_other_lines = other
+        ch.renditions = renditions
         _drop_timelines(channel_id)
     store.update_channel(ch)
     log.info("updated channel=%s name=%s", channel_id, ch.name)
@@ -262,18 +323,19 @@ async def channel_status(channel_id: str):
     ch = store.get_channel(channel_id)
     if not ch or not ch.variants:
         raise HTTPException(404, "channel not found")
-    text = await _fetch_origin_cached(app.state.http, ch.variants[0].origin_uri)
-    pl = manifest.parse_media(text, ch.variants[0].origin_uri)
+    pl = await _channel_media(channel_id, ch.variants[0].origin_uri)
     edge = _live_edge_pdt(pl)
     overlays = store.overlays_for_channel(channel_id)
     return {
         "channel_id": channel_id,
         "name": ch.name,
+        "status": ch.status,
+        "codec": "hevc" if _is_hevc(ch) else "h264",
         "live_edge_pdt": edge.isoformat() if edge else None,
         "origin_has_pdt": edge is not None,
-        "buffer_segments": config.BUFFER_SEGMENTS,
+        "buffer_segments": _effective_buffer(ch),
         "target_duration": pl.target_duration,
-        "min_lead_seconds": _min_lead_seconds(pl.target_duration),
+        "min_lead_seconds": _min_lead_seconds(pl.target_duration, ch),
         "segment_count": len(pl.segments),
         "overlay_count": len(overlays),
         "active_overlays": sum(1 for o in overlays
@@ -350,18 +412,14 @@ async def create_overlay_relative(req: CreateOverlayRelativeRequest):
         raise HTTPException(404, "channel not found")
     if not (config.UPLOAD_DIR / Path(req.image_filename).name).exists():
         raise HTTPException(400, "image_filename not uploaded")
-    text = await _fetch_origin_cached(app.state.http, ch.variants[0].origin_uri)
-    pl = manifest.parse_media(text, ch.variants[0].origin_uri)
+    pl = await _channel_media(req.channel_id, ch.variants[0].origin_uri)
     edge = _live_edge_pdt(pl)
     has_pdt = edge is not None
     if edge is None:
         edge = datetime.now(timezone.utc)
-        log.warning("origin variant 0 has NO EXT-X-PROGRAM-DATE-TIME — overlay "
-                    "matching is PDT-based and will NOT work for this origin. "
-                    "(channel=%s)", req.channel_id)
     # Enforce a minimum lead so the segments are transcoded before they reach the
-    # buffer-held live edge (item 7). Clamp up rather than reject.
-    min_lead = _min_lead_seconds(pl.target_duration)
+    # buffer-held live edge (larger for HEVC). Clamp up rather than reject.
+    min_lead = _min_lead_seconds(pl.target_duration, ch)
     start_in = max(float(req.start_in_seconds), float(min_lead))
     start = edge + timedelta(seconds=start_in)
     end = start + timedelta(seconds=req.duration_seconds)
@@ -386,8 +444,7 @@ async def list_overlays(channel_id: str):
     edge = None
     if ch.variants:
         try:
-            text = await _fetch_origin_cached(app.state.http, ch.variants[0].origin_uri)
-            edge = _live_edge_pdt(manifest.parse_media(text, ch.variants[0].origin_uri))
+            edge = _live_edge_pdt(await _channel_media(channel_id, ch.variants[0].origin_uri))
         except Exception:  # noqa: BLE001
             edge = None
     out = []
@@ -408,22 +465,76 @@ async def delete_overlay(overlay_id: str):
     return {"ok": True}
 
 
-@app.delete("/api/channels/{channel_id}")
-async def stop_channel(channel_id: str):
-    """Stop ingestion for a channel: removes it and its overlays, drops the
-    frozen timelines and cached origin manifests. The frontend stops polling
-    once this returns. Transcoded files on disk are left for cache reuse."""
-    ch = store.get_channel(channel_id)
-    if not ch:
-        raise HTTPException(404, "channel not found")
+def _teardown_processing(ch: Channel) -> None:
+    """Drop the live processing state (timelines + cached manifests) for a
+    channel without removing the channel itself."""
     for v in ch.variants:
         _origin_cache.pop(v.origin_uri, None)
         _origin_locks.pop(v.origin_uri, None)
-    _drop_timelines(channel_id)
-    store.delete_channel(channel_id)
-    log.info("stopped channel=%s", channel_id)
+    _drop_timelines(ch.id)
+
+
+@app.post("/api/channels/{channel_id}/stop", response_model=Channel)
+async def stop_channel(channel_id: str):
+    """Stop ingestion but KEEP the channel (name + origin) in the DB so it stays
+    in the channel list as 'stopped' and can be started again later."""
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    _teardown_processing(ch)
+    ch.status = "stopped"
+    store.update_channel(ch)
+    log.info("stopped channel=%s (kept)", channel_id)
     await _broadcast({"type": "channel_stopped", "channel_id": channel_id})
+    return ch
+
+
+@app.post("/api/channels/{channel_id}/start", response_model=Channel)
+async def start_channel(channel_id: str):
+    """Resume ingestion for a previously stopped channel."""
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    ch.status = "active"
+    store.update_channel(ch)
+    log.info("started channel=%s", channel_id)
+    await _broadcast({"type": "channel_started", "channel_id": channel_id})
+    return ch
+
+
+@app.delete("/api/channels/{channel_id}")
+async def delete_channel_ep(channel_id: str):
+    """Permanently delete a channel and its overlays from the DB."""
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    _teardown_processing(ch)
+    store.delete_channel(channel_id)
+    log.info("deleted channel=%s", channel_id)
+    await _broadcast({"type": "channel_deleted", "channel_id": channel_id})
     return {"ok": True}
+
+
+# --- rendition (audio / subtitle) mirroring --------------------------------
+
+@app.get("/rendition/{channel_id}/{rendition_idx}.m3u8")
+async def serve_rendition(channel_id: str, rendition_idx: int):
+    """Mirror an audio/subtitle rendition playlist: serve the m3u8 from our
+    server with segments rewritten to absolute origin URLs and all tags
+    preserved. No overlay injection — pure pass-through of the origin."""
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    rend = next((r for r in ch.renditions if r.get("idx") == rendition_idx), None)
+    if not rend:
+        raise HTTPException(404, "rendition not found")
+    try:
+        text = await _fetch_origin_cached(app.state.http, rend["origin_uri"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"rendition fetch failed: {exc}")
+    pl = manifest.parse_media(text, rend["origin_uri"])  # absolutizes segment URIs
+    return PlainTextResponse(manifest.render_media(pl),
+                             media_type="application/vnd.apple.mpegurl")
 
 
 # --- manifest serving ------------------------------------------------------
@@ -441,6 +552,11 @@ async def serve_master(channel_id: str):
         ["#EXTM3U", "#EXT-X-VERSION:3"]
     if not out or out[0] != "#EXTM3U":
         out.insert(0, "#EXTM3U")
+    # Audio/subtitle renditions: point their URI at our /rendition endpoint so
+    # the rendition playlist is also served from our server (segments absolute).
+    for r in ch.renditions:
+        rurl = f"{config.PUBLIC_BASE_URL}/rendition/{channel_id}/{r['idx']}.m3u8"
+        out.append(manifest.rewrite_media_uri(r["line"], rurl))
     for v in ch.variants:
         w = v.width or ""
         h = v.height or ""
@@ -460,11 +576,10 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
     variant = ch.variants[variant_index]
 
     try:
-        text = await _fetch_origin_cached(app.state.http, variant.origin_uri)
+        pl = await _channel_media(channel_id, variant.origin_uri)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"origin fetch failed: {exc}")
 
-    pl = manifest.parse_media(text, variant.origin_uri)
     overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
     vp = variant_video_params(variant)
     tl = _timeline(channel_id, variant_index)
@@ -516,7 +631,7 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
     before_max = tl.max_frozen_seq
     # Mirror the origin's window length so the output isn't shorter than origin.
     window_size = len(pl.segments) or 1
-    tl.advance(pl.segments, config.BUFFER_SEGMENTS, decide, window_size)
+    tl.advance(pl.segments, _effective_buffer(ch), decide, window_size)
     out = tl.render(pl.discontinuity_sequence, pl.target_duration,
                     version=pl.version, header_extra=pl.header_extra)
 
