@@ -39,6 +39,9 @@ class Channel(BaseModel):
     name: str
     master_url: str
     variants: list[VariantInfo] = Field(default_factory=list)
+    # Verbatim master-level lines (EXT-X-INDEPENDENT-SEGMENTS, EXT-X-MEDIA audio/
+    # subtitle renditions, etc.) preserved so the output master mirrors the origin.
+    master_other_lines: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
