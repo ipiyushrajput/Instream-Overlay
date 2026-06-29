@@ -110,6 +110,24 @@ lines verbatim, but point each at our child endpoint, carrying
   errors/corruption**.
 - All three variants generate their own matched overlay segments.
 
+## Squeeze-back overlays, manifest fidelity, persistence (round 3)
+
+- **Animated squeeze** (`codecs.build_squeeze_filter` + `transcode.py`): the main
+  video is scaled into an overlay *pocket* (per-type fractions in
+  `codecs.POCKETS`) animated by an eased smoothstep e(t) (0→1→0). The easing uses
+  event-global time `g=t+offset` so the animation is continuous across an event's
+  segments; segments stay 0-based for clean compositing and are shifted with
+  `-output_ts_offset` at mux time for cross-segment PTS continuity. The encode is
+  **codec-matched** (HEVC→libx265 tagged hvc1, else libx264) so it splices into an
+  HEVC origin without a codec switch.
+- **Manifest fidelity** (`manifest.py`): every non-managed tag (SCTE-35, CUE-*,
+  OATCLS, DATERANGE, KEY, MAP, …) is carried verbatim; the master preserves
+  INDEPENDENT-SEGMENTS and EXT-X-MEDIA audio/subtitle renditions (URIs absolutized
+  to origin). `timeline.py` retains a full window of history so the output mirrors
+  the origin's window length while still held buffer-behind the live edge.
+- **Persistence** (`db.py`): channels + overlays in MySQL (SQLAlchemy Core, JSON
+  payloads), hydrated on startup; graceful in-memory fallback.
+
 ## Roadmap (beyond the current build)
 
 - SQLite persistence (swap `store.py`).
