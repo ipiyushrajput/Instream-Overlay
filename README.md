@@ -74,7 +74,10 @@ curl -X POST http://127.0.0.1:8000/api/ingest \
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/ingest` | register an origin master; probes variants |
+| POST | `/api/ingest` | register a channel from an origin master; probes variants |
+| GET  | `/api/channels` | list channels |
+| GET  | `/api/channels/{cid}` | view a channel |
+| PUT  | `/api/channels/{cid}` | update name / change origin (re-probes) |
 | GET  | `/api/channels/{cid}/status` | live edge, buffer, `min_lead_seconds`, active overlays |
 | DELETE | `/api/channels/{cid}` | **stop ingestion** — drops channel, overlays, timelines |
 | GET  | `/hls/{cid}/master.m3u8` | our mirrored master (play this) |
@@ -110,6 +113,22 @@ buffering you get when a manifest mutates already-published segments.
 | `OVERLAY_DATA_DIR` | `/tmp/instream-overlay-data` | overlaid segments + uploads |
 | `OVERLAY_LOG_LEVEL` | `INFO` | set `DEBUG` to log the full ffmpeg command per transcode |
 | `OVERLAY_VERIFY_TLS` | `0` | set `1` to verify origin TLS certs |
+| `OVERLAY_ENCODER_PRESET` | `ultrafast` | x264/x265 preset for the squeezed overlay segments |
+| `OVERLAY_ENCODER_CRF` | `23` | encode quality for overlay segments |
+| `DB_HOST` / `DB_PORT` | `localhost` / `3306` | MySQL connection |
+| `DB_USER` / `DB_PASS` / `DB_NAME` | `root` / … / `instream_overlay` | MySQL auth + database |
+| `DB_ENABLED` | `1` | set `0` to run purely in-memory (no MySQL) |
+
+## Database (MySQL)
+
+Channels and overlays are persisted to MySQL so registered channels survive
+restarts. The database (`instream_overlay`) and its tables are created
+automatically on first run. Provide credentials via the `DB_*` env vars above
+(defaults match a local `root` MySQL). If MySQL is unreachable the backend logs
+a warning and continues in-memory. The four overlay types are **L-band**,
+**top_band**, **bottom_band**, and **pip**, each rendered as an animated
+squeeze-back (the main video is scaled into a pocket while the band/ad art
+shows in the freed area), encoded to match the origin codec (HEVC or H.264).
 
 ## Debugging "my overlay isn't showing"
 

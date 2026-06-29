@@ -71,6 +71,11 @@ class IngestRequest(BaseModel):
     name: Optional[str] = None
 
 
+class UpdateChannelRequest(BaseModel):
+    name: Optional[str] = None
+    master_url: Optional[str] = None  # changing this re-probes the variants
+
+
 class CreateOverlayRequest(BaseModel):
     channel_id: str
     image_filename: str
