@@ -3,9 +3,10 @@ import Hls from "hls.js";
 
 // Plays OUR mirrored master manifest. Overlays are burned into the stream, so
 // they simply appear in the video when an overlay window is active.
-export default function Player({ src, onError }) {
+export default function Player({ src, onError, onClock }) {
   const videoRef = useRef(null);
   const hlsRef = useRef(null);
+  const clockRef = useRef(null);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -28,6 +29,17 @@ export default function Player({ src, onError }) {
       hls.loadSource(src);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+
+      // Emit the PROGRAM-DATE-TIME of the frame actually on screen (the real
+      // viewer "now"), so the timeline countdown is accurate despite buffering.
+      if (onClock) {
+        clockRef.current = setInterval(() => {
+          try {
+            const d = hls.playingDate;            // Date for current playback pos
+            if (d instanceof Date && !isNaN(d.getTime())) onClock(d);
+          } catch { /* ignore */ }
+        }, 400);
+      }
 
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         // Expose for diagnostics/tests.
@@ -54,6 +66,7 @@ export default function Player({ src, onError }) {
     }
 
     return () => {
+      if (clockRef.current) { clearInterval(clockRef.current); clockRef.current = null; }
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;

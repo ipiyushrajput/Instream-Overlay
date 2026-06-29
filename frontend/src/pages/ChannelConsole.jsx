@@ -4,6 +4,7 @@ import { api, API_BASE } from "../api.js";
 import Player from "../Player.jsx";
 import OverlayControls from "../OverlayControls.jsx";
 import ApiExplorer from "../ApiExplorer.jsx";
+import Timeline from "../Timeline.jsx";
 
 export default function ChannelConsole() {
   const { id } = useParams();
@@ -11,6 +12,7 @@ export default function ChannelConsole() {
   const [channel, setChannel] = useState(null);
   const [status, setStatus] = useState(null);
   const [overlays, setOverlays] = useState([]);
+  const [playheadPdt, setPlayheadPdt] = useState(null);
   const [log, setLog] = useState([]);
   const wsRef = useRef(null);
 
@@ -95,11 +97,18 @@ export default function ChannelConsole() {
         <div className="card">
           <div className="card-head"><h3>Output (overlaid)</h3>
             <a className="hint" href={outputUrl} target="_blank" rel="noreferrer">open ↗</a></div>
-          <Player src={outputUrl} onError={() => {}} />
+          <Player src={outputUrl} onError={() => {}} onClock={setPlayheadPdt} />
           <div className="url-line"><code>{outputUrl}</code>
             <button className="ghost small" onClick={() => navigator.clipboard?.writeText(outputUrl)}>Copy</button></div>
         </div>
       </div>
+
+      <Timeline
+        playheadPdt={playheadPdt}
+        liveEdgePdt={status?.live_edge_pdt}
+        bufferSeconds={(status?.buffer_segments || 0) * (status?.target_duration || 6)}
+        overlays={overlays}
+      />
 
       {status && (
         <div className="stats">
