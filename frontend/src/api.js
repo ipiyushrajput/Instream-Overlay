@@ -26,6 +26,8 @@ export const api = {
   deleteChannel: (id) => req("DELETE", `/api/channels/${id}`),
   channelStatus: (id) => req("GET", `/api/channels/${id}/status`),
   channelDebug: (id, v = 0) => req("GET", `/api/channels/${id}/debug?variant_index=${v}`),
+  insights: () => req("GET", "/api/insights"),
+  channelInsights: (id) => req("GET", `/api/channels/${id}/insights`),
 
   // overlays
   listOverlays: (id) => req("GET", `/api/channels/${id}/overlays`),

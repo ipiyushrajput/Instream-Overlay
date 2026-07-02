@@ -8,11 +8,21 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from datetime import datetime
 
 from . import db
 from .models import Channel, OverlayEvent
 
 log = logging.getLogger("overlay.store")
+
+
+def _to_dt(v):
+    if isinstance(v, datetime) or v is None:
+        return v
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class Store:
@@ -21,6 +31,8 @@ class Store:
         self._channels: dict[str, Channel] = {}
         self._overlays: dict[str, OverlayEvent] = {}
         self._injected: dict[str, set] = {}   # overlay_id -> set of injected seqs
+        self._sessions: list[dict] = []       # viewer sessions (master hits)
+        self._deliveries: dict[str, dict] = {}  # overlay_id -> delivery record
 
     def load_from_db(self) -> None:
         """Hydrate the in-memory store from MySQL on startup."""
@@ -36,9 +48,38 @@ class Store:
                 self._overlays[ov.id] = ov
             except Exception as exc:  # noqa: BLE001
                 log.warning("skip bad overlay row: %s", exc)
+        self._sessions = db.load_sessions()
+        for d in db.load_deliveries():
+            self._deliveries[d["overlay_id"]] = d
         if self._channels or self._overlays:
-            log.info("loaded %d channel(s), %d overlay(s) from DB",
-                     len(self._channels), len(self._overlays))
+            log.info("loaded %d channel(s), %d overlay(s), %d session(s) from DB",
+                     len(self._channels), len(self._overlays), len(self._sessions))
+
+    # insights: sessions + deliveries
+    def add_session(self, row: dict) -> None:
+        with self._lock:
+            self._sessions.append(row)
+        db.add_session({**row, "session_start": _to_dt(row.get("session_start"))})
+
+    def sessions_for_channel(self, channel_id: str) -> list[dict]:
+        return [s for s in self._sessions if s.get("channel_id") == channel_id]
+
+    def record_delivery(self, overlay_id: str, channel_id: str,
+                        overlay_type: str, segments: int, status: str) -> None:
+        rec = {"overlay_id": overlay_id, "channel_id": channel_id,
+               "overlay_type": overlay_type, "segments": segments, "status": status}
+        with self._lock:
+            self._deliveries[overlay_id] = rec
+        db.upsert_delivery(rec)
+
+    def deliveries_for_channel(self, channel_id: str) -> list[dict]:
+        return [d for d in self._deliveries.values() if d.get("channel_id") == channel_id]
+
+    def all_deliveries(self) -> list[dict]:
+        return list(self._deliveries.values())
+
+    def all_sessions(self) -> list[dict]:
+        return list(self._sessions)
 
     # channels
     def add_channel(self, channel: Channel) -> Channel:
@@ -66,7 +107,10 @@ class Store:
                         if o.channel_id == channel_id]:
                 self._overlays.pop(oid, None)
                 self._injected.pop(oid, None)
+                self._deliveries.pop(oid, None)
+            self._sessions = [s for s in self._sessions if s.get("channel_id") != channel_id]
         db.delete_channel(channel_id)
+        db.delete_channel_sessions(channel_id)
         return existed
 
     # overlays
