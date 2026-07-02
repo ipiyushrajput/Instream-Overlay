@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (FastAPI, File, HTTPException, Request, UploadFile, WebSocket,
+                     WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
@@ -458,8 +459,13 @@ async def list_overlays(channel_id: str):
     out = []
     for o in store.overlays_for_channel(channel_id):
         d = o.model_dump(mode="json")
-        d["status"] = _overlay_status(o, edge)
-        d["injected_count"] = store.injected_count(o.id)
+        status = _overlay_status(o, edge)
+        injected = store.injected_count(o.id)
+        d["status"] = status
+        d["injected_count"] = injected
+        # Record a delivery once an overlay has actually put segments on air.
+        if injected > 0:
+            store.record_delivery(o.id, channel_id, o.overlay_type.value, injected, status)
         out.append(d)
     out.sort(key=lambda d: d["start_pdt"])
     return out
@@ -471,6 +477,61 @@ async def delete_overlay(overlay_id: str):
         raise HTTPException(404, "not found")
     await _broadcast({"type": "overlay_deleted", "overlay_id": overlay_id})
     return {"ok": True}
+
+
+# --- insights --------------------------------------------------------------
+
+def _channel_insights(ch: Channel) -> dict:
+    sess = store.sessions_for_channel(ch.id)
+    deliveries = store.deliveries_for_channel(ch.id)
+    overlays = store.overlays_for_channel(ch.id)
+    by_type: dict[str, dict] = {}
+    total_segments = 0
+    completed = 0
+    for d in deliveries:
+        t = d.get("overlay_type", "?")
+        e = by_type.setdefault(t, {"delivered": 0, "completed": 0, "segments": 0})
+        e["delivered"] += 1
+        e["segments"] += d.get("segments", 0) or 0
+        total_segments += d.get("segments", 0) or 0
+        if d.get("status") in ("completed", "expired"):
+            e["completed"] += 1
+            completed += 1
+    starts = sorted(s.get("session_start") for s in sess if s.get("session_start"))
+    recent = sorted(sess, key=lambda s: s.get("session_start") or "", reverse=True)[:10]
+    return {
+        "channel_id": ch.id, "name": ch.name, "status": ch.status,
+        "codec": "hevc" if _is_hevc(ch) else "h264",
+        "sessions": {
+            "total": len(sess),
+            "first": starts[0] if starts else None,
+            "last": starts[-1] if starts else None,
+            "recent": [{"uid": s.get("id"), "session_start": s.get("session_start"),
+                        "user_agent": s.get("user_agent"), "remote_ip": s.get("remote_ip")}
+                       for s in recent],
+        },
+        "overlays": {
+            "scheduled": len(overlays),
+            "delivered": len(deliveries),
+            "completed": completed,
+            "total_segments": total_segments,
+            "by_type": by_type,
+        },
+    }
+
+
+@app.get("/api/insights")
+async def all_insights():
+    """Insights across all channels (for the Insights tab)."""
+    return [_channel_insights(ch) for ch in store.list_channels()]
+
+
+@app.get("/api/channels/{channel_id}/insights")
+async def channel_insights(channel_id: str):
+    ch = store.get_channel(channel_id)
+    if not ch:
+        raise HTTPException(404, "channel not found")
+    return _channel_insights(ch)
 
 
 def _teardown_processing(ch: Channel) -> None:
@@ -636,29 +697,39 @@ async def serve_rendition_compat(channel_id: str, rname: str):
 # --- manifest serving ------------------------------------------------------
 
 @app.get("/hls/{channel_id}/master.m3u8")
-async def serve_master(channel_id: str):
+async def serve_master(channel_id: str, request: Request):
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
+    # A master hit == a viewer session. Mint a session id + start time, carry
+    # them (plus uid) on the variant + rendition URLs, and record it for
+    # Insights — unless this is our own console preview (?preview=1).
     session = new_id()
-    started = int(datetime.now(timezone.utc).timestamp() * 1000)
-    # Preserve the origin master's header lines (EXT-X-INDEPENDENT-SEGMENTS,
-    # EXT-X-MEDIA audio/subtitle renditions, …); fall back to a minimal header.
+    uid = new_id()
+    now = datetime.now(timezone.utc)
+    started = int(now.timestamp() * 1000)
+    is_preview = request.query_params.get("preview") in ("1", "true")
+    if not is_preview:
+        store.add_session({
+            "id": uid, "channel_id": channel_id, "session_start": now.isoformat(),
+            "user_agent": request.headers.get("user-agent", "")[:500],
+            "remote_ip": (request.client.host if request.client else "") or "",
+        })
+
+    qp = (f"sessionStart={started}&uid={uid}&sessionId={session}&tlSessionVer=2")
     out = list(ch.master_other_lines) if ch.master_other_lines else \
         ["#EXTM3U", "#EXT-X-VERSION:3"]
     if not out or out[0] != "#EXTM3U":
         out.insert(0, "#EXTM3U")
-    # Audio/subtitle renditions: point their URI at our /rendition endpoint so
-    # the rendition playlist is also served from our server (segments absolute).
     for r in ch.renditions:
         rname = _rendition_name(r)
-        rurl = f"{config.PUBLIC_BASE_URL}/rendition/{channel_id}/{rname}.m3u8"
+        rurl = f"{config.PUBLIC_BASE_URL}/rendition/{channel_id}/{rname}.m3u8?{qp}"
         out.append(manifest.rewrite_media_uri(r["line"], rurl))
     for v in ch.variants:
         w = v.width or ""
         h = v.height or ""
         url = (f"{config.PUBLIC_BASE_URL}/manifest/{channel_id}/{session}/{v.index}.m3u8"
-               f"?h={h}&w={w}&codecs={v.codecs}&sessionStart={started}&tlSessionVer=2")
+               f"?h={h}&w={w}&codecs={v.codecs}&{qp}")
         out.append(v.inf_line)
         out.append(url)
     return PlainTextResponse("\n".join(out) + "\n",
