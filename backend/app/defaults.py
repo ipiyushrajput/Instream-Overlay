@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import urllib.request
+
+import httpx
 
 from . import config
 
@@ -33,16 +34,24 @@ _DEFAULTS = {
 }
 
 
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
 def _download(url: str, dest) -> bool:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "instream-overlay"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = r.read()
-        if data:
-            dest.write_bytes(data)
+        with httpx.Client(follow_redirects=True, timeout=20,
+                          headers={"User-Agent": _UA, "Accept": "image/*,*/*"}) as c:
+            r = c.get(url)
+        r.raise_for_status()
+        ctype = r.headers.get("content-type", "")
+        if r.content and ("image" in ctype or len(r.content) > 200):
+            dest.write_bytes(r.content)
+            log.info("downloaded default image %s (%d bytes, %s)", dest.name, len(r.content), ctype)
             return True
+        log.warning("default image %s returned non-image content-type=%s", url, ctype)
     except Exception as exc:  # noqa: BLE001
-        log.info("default image download failed (%s): %s", url, exc)
+        log.warning("default image download failed (%s): %s", url, exc)
     return False
 
 
@@ -57,13 +66,17 @@ def _placeholder(chain: str, dest) -> None:
 
 
 def ensure_default_overlays() -> None:
+    """Refresh the default band art from the configured URLs. Always re-download
+    so an updated URL (or a previous black placeholder) is replaced; only fall
+    back to a generated placeholder when the download fails AND we have nothing."""
     config.ensure_dirs()
     for _otype, (fname, _label, url, chain) in _DEFAULTS.items():
         dest = config.UPLOAD_DIR / fname
-        if dest.exists() and dest.stat().st_size > 0:
+        if _download(url, dest):
             continue
-        if not _download(url, dest):
+        if not (dest.exists() and dest.stat().st_size > 0):
             _placeholder(chain, dest)
+            log.info("using generated placeholder for %s (download failed)", fname)
     log.info("default overlay art ready in %s", config.UPLOAD_DIR)
 
 
