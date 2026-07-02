@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Optional
 
-from sqlalchemy import (Column, DateTime, MetaData, String, Table, Text,
+from sqlalchemy import (Column, DateTime, Integer, MetaData, String, Table, Text,
                         create_engine, delete, func, insert, select, update)
 from sqlalchemy.engine import Engine
 
@@ -37,6 +37,28 @@ overlays = Table(
     Column("channel_id", String(64), index=True),
     Column("data", Text),                      # JSON: full OverlayEvent model
     Column("created_at", DateTime, server_default=func.now()),
+)
+
+# One row per master-manifest hit (a viewer session).
+sessions = Table(
+    "sessions", metadata,
+    Column("id", String(64), primary_key=True),        # uid / session id
+    Column("channel_id", String(64), index=True),
+    Column("session_start", DateTime),
+    Column("user_agent", Text),
+    Column("remote_ip", String(64)),
+    Column("created_at", DateTime, server_default=func.now()),
+)
+
+# One row per overlay that was actually delivered (its segments injected).
+deliveries = Table(
+    "overlay_deliveries", metadata,
+    Column("overlay_id", String(64), primary_key=True),
+    Column("channel_id", String(64), index=True),
+    Column("overlay_type", String(32)),
+    Column("segments", Integer),
+    Column("status", String(16)),
+    Column("delivered_at", DateTime, server_default=func.now()),
 )
 
 _engine: Optional[Engine] = None
@@ -155,4 +177,76 @@ def load_overlays() -> list[dict]:
         return [json.loads(r[0]) for r in rows if r[0]]
     except Exception as exc:  # noqa: BLE001
         log.warning("load_overlays failed: %s", exc)
+        return []
+
+
+# --- insights: sessions + overlay deliveries --------------------------------
+
+def add_session(row: dict) -> None:
+    if _engine is None:
+        return
+    try:
+        with _engine.begin() as conn:
+            conn.execute(insert(sessions).values(**row))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("add_session failed: %s", exc)
+
+
+def delete_channel_sessions(channel_id: str) -> None:
+    if _engine is None:
+        return
+    try:
+        with _engine.begin() as conn:
+            conn.execute(delete(sessions).where(sessions.c.channel_id == channel_id))
+            conn.execute(delete(deliveries).where(deliveries.c.channel_id == channel_id))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("delete_channel_sessions failed: %s", exc)
+
+
+def load_sessions() -> list[dict]:
+    if _engine is None:
+        return []
+    try:
+        with _engine.connect() as conn:
+            rows = conn.execute(select(
+                sessions.c.id, sessions.c.channel_id, sessions.c.session_start,
+                sessions.c.user_agent, sessions.c.remote_ip)).fetchall()
+        return [{"id": r[0], "channel_id": r[1],
+                 "session_start": r[2].isoformat() if r[2] else None,
+                 "user_agent": r[3], "remote_ip": r[4]} for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("load_sessions failed: %s", exc)
+        return []
+
+
+def upsert_delivery(row: dict) -> None:
+    if _engine is None:
+        return
+    try:
+        with _engine.begin() as conn:
+            exists = conn.execute(select(deliveries.c.overlay_id)
+                                  .where(deliveries.c.overlay_id == row["overlay_id"])).first()
+            if exists:
+                conn.execute(update(deliveries)
+                             .where(deliveries.c.overlay_id == row["overlay_id"])
+                             .values(segments=row["segments"], status=row["status"]))
+            else:
+                conn.execute(insert(deliveries).values(**row))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("upsert_delivery failed: %s", exc)
+
+
+def load_deliveries() -> list[dict]:
+    if _engine is None:
+        return []
+    try:
+        with _engine.connect() as conn:
+            rows = conn.execute(select(
+                deliveries.c.overlay_id, deliveries.c.channel_id,
+                deliveries.c.overlay_type, deliveries.c.segments,
+                deliveries.c.status)).fetchall()
+        return [{"overlay_id": r[0], "channel_id": r[1], "overlay_type": r[2],
+                 "segments": r[3], "status": r[4]} for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("load_deliveries failed: %s", exc)
         return []
