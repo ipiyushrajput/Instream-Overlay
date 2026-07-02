@@ -109,7 +109,13 @@ class VariantTimeline:
         self._prune_below(render_low)
 
     def render(self, origin_base_disc_seq: int, target_duration: int,
-               version: int = 3, header_extra: Optional[list] = None) -> MediaPlaylist:
+               version: int = 3, header_extra: Optional[list] = None,
+               uri_for=None, tags_for=None) -> MediaPlaylist:
+        """Render the frozen window. ``uri_for(seq)`` / ``tags_for(seq)`` let an
+        alternate rendition (audio/subtitle) reuse this timeline's exact
+        structure — same MEDIA-SEQUENCE, DISCONTINUITY-SEQUENCE, discontinuity
+        positions, PDT and durations — while substituting its own segment URLs
+        (and tags), so video and its renditions stay perfectly aligned."""
         pl = MediaPlaylist(version=version, target_duration=target_duration)
         pl.header_extra = header_extra or []
         seqs = sorted(self.frozen)
@@ -117,18 +123,19 @@ class VariantTimeline:
             pl.media_sequence = max(0, self.max_frozen_seq + 1)
             return pl
         low = seqs[0]
-        # DISCONTINUITY-SEQUENCE = origin's own count + injected discontinuities
-        # that have scrolled out + the injected boundary folded into the first
-        # exposed segment (its leading DISCONTINUITY tag is not re-emitted).
         pl.discontinuity_sequence = (origin_base_disc_seq + self.scrolled_injected
                                      + (1 if self.frozen[low].disc_injected else 0))
         pl.media_sequence = low
         for i, sq in enumerate(seqs):
             d = self.frozen[sq]
-            seg = MediaSegment(uri=d.uri, duration=d.duration, seq=d.seq,
-                               pdt=d.pdt, tags=list(d.tags))
-            # Fold the first segment's leading discontinuity into disc-sequence;
-            # emit tags for all later boundaries (native or injected).
+            uri = uri_for(sq) if uri_for else d.uri
+            if uri is None:
+                # Rendition segment for this seq is unavailable — reuse the
+                # decision's own tags but skip only if we truly have nothing.
+                uri = d.uri
+            tags = (tags_for(sq) if tags_for else d.tags) or []
+            seg = MediaSegment(uri=uri, duration=d.duration, seq=d.seq,
+                               pdt=d.pdt, tags=list(tags))
             seg.discontinuity_before = (i > 0) and (d.disc_native or d.disc_injected)
             pl.segments.append(seg)
         return pl

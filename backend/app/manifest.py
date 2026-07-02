@@ -80,6 +80,7 @@ class Rendition:
     idx: int
     line: str          # original #EXT-X-MEDIA line (URI still pointing at origin)
     origin_uri: str    # absolute origin URI of the rendition playlist
+    name: str = ""     # distinct slug used in our URL, e.g. "subtitles-eng-0"
 
 
 @dataclass
@@ -152,8 +153,13 @@ def parse_master(text: str, base_url: str) -> MasterPlaylist:
             # render time). Keep the original line for faithful re-emit.
             m = _URI_ATTR_RE.search(line)
             origin_uri = urljoin(base_url, m.group(1)) if m else ""
+            attrs = parse_attributes(line)
+            idx = len(master.renditions)
+            typ = (attrs.get("TYPE", "media") or "media").lower()
+            lang = (attrs.get("LANGUAGE", "") or "").lower()
+            slug = "-".join(p for p in (typ, lang, str(idx)) if p)
             master.renditions.append(Rendition(
-                idx=len(master.renditions), line=line.strip(), origin_uri=origin_uri))
+                idx=idx, line=line.strip(), origin_uri=origin_uri, name=slug))
             i += 1
         else:
             master.other_lines.append(line.strip())
@@ -211,10 +217,17 @@ def parse_media(text: str, base_url: str) -> MediaPlaylist:
                 pending_duration = 0.0
         elif line == "#EXT-X-ENDLIST":
             pl.endlist = True
+        elif line.startswith("#EXT-X-INDEPENDENT-SEGMENTS") or line.startswith("#EXT-X-START"):
+            # Truly playlist-global tags -> header.
+            pl.header_extra.append(line)
         elif line.startswith("#"):
-            # Any other tag -> passthrough. Before the first segment it's a
-            # playlist-level tag; otherwise it belongs to the next segment.
-            (pl.header_extra if not seen_first_segment else pending_tags).append(line)
+            # Any other tag (SCTE-35 / CUE-OUT[-CONT] / CUE-IN / OATCLS / ASSET /
+            # DATERANGE / MAP / KEY …) belongs to the NEXT segment — including
+            # ones before the first segment. Attaching them to the segment (not a
+            # global header) keeps them correct when our window is shifted behind
+            # the origin's live edge; otherwise a stale CUE from the origin's
+            # current first segment leaks onto our (older) first segment.
+            pending_tags.append(line)
         else:
             seen_first_segment = True
             pl.segments.append(MediaSegment(
