@@ -74,11 +74,11 @@ button.danger { background: var(--danger); }
 button.small { padding: 7px 11px; font-size: 13px; }
 
 .grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: 18px; }
-.left, .right { display: flex; flex-direction: column; gap: 18px; }
+.left, .right { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 
 .card {
   background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
-  padding: 18px; box-shadow: var(--shadow);
+  padding: 18px; box-shadow: var(--shadow); min-width: 0;
 }
 .card h3 { margin: 0 0 14px; font-size: 14px; letter-spacing: -0.01em; }
 .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
@@ -230,6 +230,11 @@ video { width: 100%; background: #0b0e16; border-radius: 12px; display: block; }
 .status-dot.stopped { background: var(--muted); }
 
 button.success { background: var(--success); color: #fff; }
+/* Green "Open" link styled like the buttons (item 7). */
+a.btn.small { padding: 7px 11px; font-size: 13px; font-weight: 600; border-radius: 10px;
+  border: 1px solid transparent; cursor: pointer; }
+a.success { background: var(--success); color: #fff; }
+a.success:hover { filter: brightness(1.05); }
 
 /* --- live timeline (DVR scrubber, Option A) --- */
 .timeline { margin-bottom: 16px; }
@@ -261,3 +266,26 @@ button.success { background: var(--success); color: #fff; }
 .tl-cd { position: absolute; transform: translateX(-50%); font-size: 11px; font-weight: 800; white-space: nowrap; }
 .tl-cd.upcoming { color: #18a957; }
 .tl-cd.onair { color: var(--live); }
+
+/* --- persistent left sidebar shell (left-aligned, fixed nav) --- */
+.shell { display: flex; align-items: stretch; min-height: 100vh; }
+.sidebar { width: 244px; flex: none; background: var(--surface); border-right: 1px solid var(--border);
+  padding: 20px 14px; position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; gap: 20px; }
+.sidebar .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; color: inherit; }
+.sidebar .brand h1 { font-size: 16px; margin: 0; letter-spacing: -0.02em; }
+.sidebar .brand .sub { font-size: 11px; color: var(--muted); }
+.side-nav { display: flex; flex-direction: column; gap: 4px; }
+.side-link { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border-radius: 10px;
+  color: var(--text); text-decoration: none; font-weight: 600; font-size: 14px; }
+.side-link:hover { background: var(--surface-2); }
+.side-link.active { background: #eef3ff; color: var(--primary); }
+.side-ic { width: 22px; text-align: center; opacity: .8; font-weight: 700; }
+.content { flex: 1; min-width: 0; padding: 26px 30px 64px; }
+.page-title { font-size: 21px; margin: 0 0 18px; letter-spacing: -0.02em; }
+.btn { display: inline-flex; align-items: center; text-decoration: none; }
+
+/* Long single-line JSON (e.g. SCTE-35) scrolls inside a fixed box instead of
+   widening the page — needs the whole ancestor chain to allow shrinking. */
+.content > * { min-width: 0; }
+.api-out { min-width: 0; }
+.api-out pre { width: 100%; max-width: 100%; overflow: auto; white-space: pre; overflow-x: auto; }
