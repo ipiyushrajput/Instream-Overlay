@@ -537,8 +537,33 @@ def _reconstruct_seg_url(template: str, seq: int) -> Optional[str]:
     return template[:m.start(1)] + str(seq).zfill(width) + m.group(2)
 
 
-@app.get("/rendition/{channel_id}/{rname}.m3u8")
-async def serve_rendition(channel_id: str, rname: str):
+def _rendition_name(r: dict) -> str:
+    """Stable slug for a rendition URL. Older channels (persisted before the
+    name field existed) get one derived from their EXT-X-MEDIA line."""
+    if r.get("name"):
+        return r["name"]
+    attrs = manifest.parse_attributes(r.get("line", ""))
+    typ = (attrs.get("TYPE", "media") or "media").lower()
+    lang = (attrs.get("LANGUAGE", "") or "").lower()
+    return "-".join(p for p in (typ, lang, str(r.get("idx", 0))) if p)
+
+
+def _find_rendition(ch, rname: str) -> Optional[dict]:
+    """Resolve a rendition by its slug, its ``rendition-{idx}`` fallback, or a
+    trailing integer index — robust to old/renamed data."""
+    for r in ch.renditions:
+        if _rendition_name(r) == rname or r.get("name") == rname:
+            return r
+        if rname == f"rendition-{r.get('idx')}":
+            return r
+    m = re.search(r"(\d+)$", rname)
+    if m:
+        idx = int(m.group(1))
+        return next((r for r in ch.renditions if r.get("idx") == idx), None)
+    return None
+
+
+async def _render_rendition(channel_id: str, rname: str):
     """Mirror an audio/subtitle rendition, kept in lock-step with the video.
 
     Renditions must stay aligned with the video variants (same MEDIA-SEQUENCE,
@@ -549,7 +574,7 @@ async def serve_rendition(channel_id: str, rname: str):
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
-    rend = next((r for r in ch.renditions if r.get("name") == rname), None)
+    rend = _find_rendition(ch, rname)
     if not rend:
         raise HTTPException(404, "rendition not found")
     idx = rend["idx"]
@@ -594,6 +619,20 @@ async def serve_rendition(channel_id: str, rname: str):
                              media_type="application/vnd.apple.mpegurl")
 
 
+@app.get("/rendition/{channel_id}/{rname}.m3u8")
+async def serve_rendition(channel_id: str, rname: str):
+    return await _render_rendition(channel_id, rname)
+
+
+# Compatibility route: some players resolve the EXT-X-MEDIA subtitle/audio URI
+# relative to the video child manifest (/manifest/…) rather than the master, so
+# accept renditions under /manifest/{cid}/{rname}.m3u8 too. (This has 2 path
+# parts, so it never collides with the 3-part video child route below.)
+@app.get("/manifest/{channel_id}/{rname}.m3u8")
+async def serve_rendition_compat(channel_id: str, rname: str):
+    return await _render_rendition(channel_id, rname)
+
+
 # --- manifest serving ------------------------------------------------------
 
 @app.get("/hls/{channel_id}/master.m3u8")
@@ -612,7 +651,7 @@ async def serve_master(channel_id: str):
     # Audio/subtitle renditions: point their URI at our /rendition endpoint so
     # the rendition playlist is also served from our server (segments absolute).
     for r in ch.renditions:
-        rname = r.get("name") or f"rendition-{r['idx']}"
+        rname = _rendition_name(r)
         rurl = f"{config.PUBLIC_BASE_URL}/rendition/{channel_id}/{rname}.m3u8"
         out.append(manifest.rewrite_media_uri(r["line"], rurl))
     for v in ch.variants:
