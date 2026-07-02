@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,8 @@ def _timeline(channel_id: str, variant_index: int) -> VariantTimeline:
 def _drop_timelines(channel_id: str) -> None:
     for key in [k for k in _timelines if k[0] == channel_id]:
         _timelines.pop(key, None)
+    for key in [k for k in _rendition_segs if k[0] == channel_id]:
+        _rendition_segs.pop(key, None)
     _synth_pdt.pop(channel_id, None)
 
 
@@ -44,6 +47,11 @@ def _drop_timelines(channel_id: str) -> None:
 # no PDT at all. Assigned once per segment from the wall clock and reused so the
 # value is stable across reloads (required for playlist immutability).
 _synth_pdt: dict[str, dict[int, str]] = {}
+
+# Remembered rendition segment URLs/tags by seq (keyed by (channel, idx)) so we
+# can serve the same buffer-held window the video timeline exposes even after
+# the origin rendition playlist scrolls those segments off.
+_rendition_segs: dict[tuple, dict[int, tuple]] = {}
 
 
 def _ensure_pdt(channel_id: str, pl) -> bool:
@@ -254,8 +262,8 @@ def _probe_master(text: str, master_url: str) -> tuple[list[VariantInfo], list[s
             width=vp.width, height=vp.height, fps=vp.fps,
             profile=vp.profile, level=vp.level, pix_fmt=vp.pix_fmt,
             bitrate_kbps=vp.bitrate_kbps, has_audio=vp.has_audio))
-    renditions = [{"idx": r.idx, "line": r.line, "origin_uri": r.origin_uri}
-                  for r in master.renditions]
+    renditions = [{"idx": r.idx, "line": r.line, "origin_uri": r.origin_uri,
+                   "name": r.name} for r in master.renditions]
     return (variants, master.other_lines, renditions)
 
 
@@ -517,23 +525,72 @@ async def delete_channel_ep(channel_id: str):
 
 # --- rendition (audio / subtitle) mirroring --------------------------------
 
-@app.get("/rendition/{channel_id}/{rendition_idx}.m3u8")
-async def serve_rendition(channel_id: str, rendition_idx: int):
-    """Mirror an audio/subtitle rendition playlist: serve the m3u8 from our
-    server with segments rewritten to absolute origin URLs and all tags
-    preserved. No overlay injection — pure pass-through of the origin."""
+def _reconstruct_seg_url(template: str, seq: int) -> Optional[str]:
+    """Build a rendition segment URL for ``seq`` from a sibling URL template by
+    replacing its trailing numeric run (e.g. seg_0115651.vtt -> seg_0115660.vtt),
+    preserving zero-padding. Used when a needed seq is no longer in the origin
+    playlist window."""
+    m = re.search(r"(\d+)(\.\w+)$", template)
+    if not m:
+        return None
+    width = len(m.group(1))
+    return template[:m.start(1)] + str(seq).zfill(width) + m.group(2)
+
+
+@app.get("/rendition/{channel_id}/{rname}.m3u8")
+async def serve_rendition(channel_id: str, rname: str):
+    """Mirror an audio/subtitle rendition, kept in lock-step with the video.
+
+    Renditions must stay aligned with the video variants (same MEDIA-SEQUENCE,
+    DISCONTINUITY-SEQUENCE, discontinuity positions, PDT and buffer hold-back) or
+    the player buffers/desyncs. We therefore render the rendition through the
+    *video* timeline's frozen structure, substituting the origin rendition's own
+    (absolute) segment URLs — no transcoding, no overlay."""
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
-    rend = next((r for r in ch.renditions if r.get("idx") == rendition_idx), None)
+    rend = next((r for r in ch.renditions if r.get("name") == rname), None)
     if not rend:
         raise HTTPException(404, "rendition not found")
+    idx = rend["idx"]
     try:
         text = await _fetch_origin_cached(app.state.http, rend["origin_uri"])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"rendition fetch failed: {exc}")
-    pl = manifest.parse_media(text, rend["origin_uri"])  # absolutizes segment URIs
-    return PlainTextResponse(manifest.render_media(pl),
+    sub_pl = manifest.parse_media(text, rend["origin_uri"])  # absolute seg URIs
+
+    # Remember every seq we see so we can serve older buffer-held segments too.
+    mem = _rendition_segs.setdefault((channel_id, idx), {})
+    template = sub_pl.segments[0].uri if sub_pl.segments else None
+    for s in sub_pl.segments:
+        mem[s.seq] = (s.uri, s.tags)
+
+    # Mirror the video variant-0 timeline so both stay perfectly aligned.
+    tl = _timeline(channel_id, 0)
+    if not tl.frozen:
+        # Video hasn't been requested yet — serve the origin rendition as-is.
+        for s in [s for s in mem if s < (sub_pl.media_sequence - 200)]:
+            mem.pop(s, None)
+        return PlainTextResponse(manifest.render_media(sub_pl),
+                                 media_type="application/vnd.apple.mpegurl")
+
+    def uri_for(seq: int) -> Optional[str]:
+        e = mem.get(seq)
+        if e:
+            return e[0]
+        return _reconstruct_seg_url(template, seq) if template else None
+
+    def tags_for(seq: int):
+        e = mem.get(seq)
+        return e[1] if e else []
+
+    out = tl.render(sub_pl.discontinuity_sequence, sub_pl.target_duration,
+                    version=sub_pl.version, header_extra=sub_pl.header_extra,
+                    uri_for=uri_for, tags_for=tags_for)
+    # Prune remembered entries well below the rendered window.
+    for s in [s for s in mem if s < out.media_sequence - 200]:
+        mem.pop(s, None)
+    return PlainTextResponse(manifest.render_media(out),
                              media_type="application/vnd.apple.mpegurl")
 
 
@@ -555,7 +612,8 @@ async def serve_master(channel_id: str):
     # Audio/subtitle renditions: point their URI at our /rendition endpoint so
     # the rendition playlist is also served from our server (segments absolute).
     for r in ch.renditions:
-        rurl = f"{config.PUBLIC_BASE_URL}/rendition/{channel_id}/{r['idx']}.m3u8"
+        rname = r.get("name") or f"rendition-{r['idx']}"
+        rurl = f"{config.PUBLIC_BASE_URL}/rendition/{channel_id}/{rname}.m3u8"
         out.append(manifest.rewrite_media_uri(r["line"], rurl))
     for v in ch.variants:
         w = v.width or ""

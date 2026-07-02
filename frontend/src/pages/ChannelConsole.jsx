@@ -13,10 +13,34 @@ export default function ChannelConsole() {
   const [status, setStatus] = useState(null);
   const [overlays, setOverlays] = useState([]);
   const [playheadPdt, setPlayheadPdt] = useState(null);
+  const [copied, setCopied] = useState(false);
   const [log, setLog] = useState([]);
   const wsRef = useRef(null);
 
   const outputUrl = api.masterUrl(id);
+
+  async function copyUrl() {
+    let ok = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(outputUrl);
+        ok = true;
+      }
+    } catch { /* fall through to legacy path */ }
+    if (!ok) {
+      // Fallback for non-secure contexts / older browsers.
+      const ta = document.createElement("textarea");
+      ta.value = outputUrl;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      try { ok = document.execCommand("copy"); } catch { ok = false; }
+      document.body.removeChild(ta);
+    }
+    setCopied(ok);
+    setTimeout(() => setCopied(false), 1500);
+  }
 
   function pushLog(line) {
     setLog((l) => [`${new Date().toLocaleTimeString()}  ${line}`, ...l].slice(0, 150));
@@ -99,7 +123,7 @@ export default function ChannelConsole() {
             <a className="hint" href={outputUrl} target="_blank" rel="noreferrer">open ↗</a></div>
           <Player src={outputUrl} onError={() => {}} onClock={setPlayheadPdt} />
           <div className="url-line"><code>{outputUrl}</code>
-            <button className="ghost small" onClick={() => navigator.clipboard?.writeText(outputUrl)}>Copy</button></div>
+            <button className="ghost small" onClick={copyUrl}>{copied ? "Copied ✓" : "Copy"}</button></div>
         </div>
       </div>
 
