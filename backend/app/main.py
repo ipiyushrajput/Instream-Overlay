@@ -166,12 +166,13 @@ def _effective_buffer(ch: Channel) -> int:
 
 
 def _min_lead_seconds(target_duration: int, ch: Optional[Channel] = None) -> int:
-    """Minimum lead before an overlay window starts. Must cover the buffer
-    hold-back (where transcoding happens) plus margin. The squeeze + codec-match
-    (HEVC) encode is heavier, so the effective buffer is larger for HEVC."""
+    """Minimum lead before an overlay window starts. Must place the whole window
+    BEYOND the buffer hold-back (where pre-transcoding happens) with margin, so by
+    the time a covered segment reaches our held-back live edge every variant has
+    already been transcoded. Larger effective buffer (HEVC) pushes this out."""
     td = target_duration or 6
     buf = _effective_buffer(ch) if ch is not None else config.BUFFER_SEGMENTS
-    return int((buf + 1) * td)
+    return int((buf + 2) * td)
 
 
 log = logging.getLogger("overlay.api")
@@ -192,7 +193,11 @@ async def lifespan(app: FastAPI):
                                        verify=config.VERIFY_TLS)
     pool.set_status_callback(_broadcast)
     pool.start()
+    # Background pre-warm: transcode overlays across all variants the moment their
+    # segments appear at the origin, well ahead of the held-back output edge.
+    app.state.prewarm = asyncio.create_task(_prewarm_loop())
     yield
+    app.state.prewarm.cancel()
     await pool.stop()
     await app.state.http.aclose()
 
@@ -736,6 +741,117 @@ async def serve_master(channel_id: str, request: Request):
                              media_type="application/vnd.apple.mpegurl")
 
 
+# --- overlay coverage, jobs and the all-variants readiness gate ------------
+
+def _overlay_covering(overlays, seg) -> Optional[OverlayEvent]:
+    """Overlap-based coverage: a segment is overlaid if its own [start,end)
+    interval intersects the overlay window [start,end). This (vs the old
+    start-only test) makes the FULL requested duration get overlaid — the leading
+    partial segment and the trailing segment included — instead of only the
+    segments whose start happened to fall inside the window."""
+    sp = _parse_pdt(seg.pdt)
+    if sp is None:
+        return None
+    se = sp + timedelta(seconds=seg.duration or 0.0)
+    for o in overlays:
+        if o.enabled and sp < o.end_pdt and se > o.start_pdt:
+            return o
+    return None
+
+
+def _overlay_anchors(overlays, pl) -> dict:
+    """overlay_id -> PDT of its earliest covered segment in this playlist. Used as
+    the mux anchor so every segment of one event gets a continuous, >=0
+    output_ts_offset (they splice together without a PTS gap/overlap)."""
+    anchors: dict = {}
+    for seg in pl.segments:
+        o = _overlay_covering(overlays, seg)
+        if o is None:
+            continue
+        sp = _parse_pdt(seg.pdt)
+        if sp is not None and (o.id not in anchors or sp < anchors[o.id]):
+            anchors[o.id] = sp
+    return anchors
+
+
+def _make_overlay_job(channel_id: str, variant_index: int, vp, seg,
+                      overlay: OverlayEvent, anchor_pdt) -> Job:
+    sp = _parse_pdt(seg.pdt)
+    duration = (overlay.end_pdt - overlay.start_pdt).total_seconds()
+    event_offset = (sp - overlay.start_pdt).total_seconds() if sp else 0.0
+    mux_offset = 0.0
+    if sp is not None and anchor_pdt is not None:
+        mux_offset = max(0.0, (sp - anchor_pdt).total_seconds())
+    return Job(
+        channel_id=channel_id, variant_index=variant_index,
+        overlay_id=overlay.id, seq=seg.seq, origin_url=seg.uri,
+        overlay_image=str(config.UPLOAD_DIR / overlay.image_filename),
+        vp=vp, overlay_type=overlay.overlay_type.value,
+        event_offset=event_offset, duration=duration,
+        seg_duration=(seg.duration or 0.0), mux_offset=mux_offset)
+
+
+def _all_variants_ready(ch: Channel, overlay_id: str, seq: int) -> tuple:
+    """(all_ready, ready_count). An overlaid segment is only published once EVERY
+    variant has its copy transcoded, so an ABR switch never lands on a
+    not-yet-ready variant (the root of cross-variant desync/buffering)."""
+    ready = sum(1 for vi in range(len(ch.variants))
+                if pool.status_of(ch.id, vi, overlay_id, seq) == JobStatus.READY)
+    return ready == len(ch.variants) and ready > 0, ready
+
+
+# One skip-log per (overlay, seq) so a not-ready gate is visible but not spammy.
+_skip_logged: set = set()
+
+
+def _log_skip(channel_id: str, overlay_id: str, seq: int, ready: int, total: int) -> None:
+    k = (channel_id, overlay_id, seq)
+    if k in _skip_logged:
+        return
+    _skip_logged.add(k)
+    log.warning("skipping overlay %s seq=%s: transcoding in progress "
+                "(%d/%d variants ready) — playing origin segment",
+                overlay_id, seq, ready, total)
+    if len(_skip_logged) > 5000:
+        _skip_logged.clear()
+
+
+# --- background pre-warm: transcode overlays the moment they're schedulable --
+
+async def _prewarm_channel(ch: Channel) -> None:
+    """Queue overlay transcodes for EVERY variant as soon as a covered origin
+    segment appears — long before it reaches our held-back live edge. This is
+    what starts transcoding right after an overlay is scheduled (the input
+    segments arrive early) and fans the work out across all variants in
+    parallel, so segments are ready before any player asks for them."""
+    overlays = [o for o in store.overlays_for_channel(ch.id) if o.enabled]
+    if not overlays:
+        return
+    for vi, variant in enumerate(ch.variants):
+        try:
+            pl = await _channel_media(ch.id, variant.origin_uri)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("prewarm origin fetch failed ch=%s v%s: %s", ch.id, vi, exc)
+            continue
+        vp = variant_video_params(variant)
+        anchors = _overlay_anchors(overlays, pl)
+        for seg in pl.segments:
+            o = _overlay_covering(overlays, seg)
+            if o is not None:
+                pool.ensure(_make_overlay_job(ch.id, vi, vp, seg, o, anchors.get(o.id)))
+
+
+async def _prewarm_loop() -> None:
+    while True:
+        try:
+            for ch in store.list_channels():
+                if ch.status == "active" and ch.variants:
+                    await _prewarm_channel(ch)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("prewarm loop error: %s", exc)
+        await asyncio.sleep(config.PREWARM_INTERVAL)
+
+
 @app.get("/manifest/{channel_id}/{session_id}/{variant_index}.m3u8")
 async def serve_child(channel_id: str, session_id: str, variant_index: int):
     ch = store.get_channel(channel_id)
@@ -751,54 +867,38 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
     overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
     vp = variant_video_params(variant)
     tl = _timeline(channel_id, variant_index)
+    anchors = _overlay_anchors(overlays, pl)
 
-    def overlay_for(seg) -> Optional[OverlayEvent]:
-        seg_pdt = _parse_pdt(seg.pdt)
-        if seg_pdt is None:
-            return None
-        for o in overlays:
-            if o.covers(seg_pdt):
-                return o
-        return None
-
-    def make_job(seg, overlay: OverlayEvent) -> Job:
-        seg_pdt = _parse_pdt(seg.pdt)
-        offset = 0.0
-        if seg_pdt is not None:
-            offset = max(0.0, (seg_pdt - overlay.start_pdt).total_seconds())
-        duration = (overlay.end_pdt - overlay.start_pdt).total_seconds()
-        return Job(
-            channel_id=channel_id, variant_index=variant_index,
-            overlay_id=overlay.id, seq=seg.seq, origin_url=seg.uri,
-            overlay_image=str(config.UPLOAD_DIR / overlay.image_filename),
-            vp=vp, overlay_type=overlay.overlay_type.value,
-            offset=offset, duration=duration)
-
-    # Look-ahead: kick off transcodes for EVERY covered segment in the full
-    # origin window (including the buffered tail) so they're ready before the
-    # frozen edge reaches them.
+    # Look-ahead safety net: make sure THIS variant's covered segments are queued
+    # (the background pre-warm loop already queues every variant continuously).
     for seg in pl.segments:
-        ov = overlay_for(seg)
+        ov = _overlay_covering(overlays, seg)
         if ov is not None and seg.seq > tl.max_frozen_seq:
-            pool.ensure(make_job(seg, ov))
+            pool.ensure(_make_overlay_job(channel_id, variant_index, vp, seg, ov,
+                                          anchors.get(ov.id)))
 
     def decide(seg):
-        """origin / overlay(READY) / None(wait) — see timeline.DecideFn."""
-        ov = overlay_for(seg)
+        """origin / overlay(all-variants READY). Never returns None: we never
+        stall the live edge waiting for a transcode. If the overlaid segment
+        isn't ready on every variant yet, we publish the plain origin segment and
+        log a skip — so playback never buffers on an overlay transition."""
+        ov = _overlay_covering(overlays, seg)
         if ov is None:
             return ("origin", seg.uri, None)
-        status = pool.ensure(make_job(seg, ov))
-        if status == JobStatus.READY:
+        pool.ensure(_make_overlay_job(channel_id, variant_index, vp, seg, ov,
+                                      anchors.get(ov.id)))
+        ready, nready = _all_variants_ready(ch, ov.id, seg.seq)
+        if ready:
             store.mark_injected(ov.id, seg.seq)
             rel = f"/segment/{channel_id}/{variant_index}/{ov.id}/{seg.seq}.ts"
             return ("overlay", rel, ov.id)
-        if status == JobStatus.FAILED:
-            return ("origin", seg.uri, None)  # don't wait on a failed transcode
-        return None  # pending -> hold the edge here until it's ready
+        _log_skip(channel_id, ov.id, seg.seq, nready, len(ch.variants))
+        return ("origin", seg.uri, None)
 
     before_max = tl.max_frozen_seq
-    # Mirror the origin's window length so the output isn't shorter than origin.
-    window_size = len(pl.segments) or 1
+    # Output DVR depth is kept small and independent of the big hold-back, so the
+    # oldest segment we reference still lives inside the origin's window.
+    window_size = min(len(pl.segments) or 1, config.OUTPUT_WINDOW_SEGMENTS)
     tl.advance(pl.segments, _effective_buffer(ch), decide, window_size)
     out = tl.render(pl.discontinuity_sequence, pl.target_duration,
                     version=pl.version, header_extra=pl.header_extra)
@@ -840,11 +940,7 @@ async def debug_channel(channel_id: str, variant_index: int = 0):
     rows = []
     for seg in pl.segments:
         seg_pdt = _parse_pdt(seg.pdt)
-        covering = None
-        for o in overlays:
-            if seg_pdt is not None and o.covers(seg_pdt):
-                covering = o
-                break
+        covering = _overlay_covering(overlays, seg)  # overlap-based, matches serving
         status = err = None
         if covering is not None:
             st = pool.status_of(channel_id, variant_index, covering.id, seg.seq)

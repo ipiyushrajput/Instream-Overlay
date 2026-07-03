@@ -37,15 +37,11 @@ export default function App() {
                  onError={(e) => { e.currentTarget.style.display = "none"; }} />
             {!collapsed && (
               <div className="brand-txt">
-                <h1>Instream Overlay</h1>
-                <div className="sub">Live HLS overlays</div>
+                <h1>TV Plus STUDIO</h1>
+                <div className="sub">Instream Overlays</div>
               </div>
             )}
           </div>
-          <button className="side-toggle" onClick={toggle}
-                  title={collapsed ? "Expand" : "Collapse"} aria-label="Toggle sidebar">
-            {collapsed ? "»" : "«"}
-          </button>
         </div>
 
         <nav className="side-nav">
@@ -57,6 +53,14 @@ export default function App() {
             </NavLink>
           ))}
         </nav>
+
+        <div className="side-bottom">
+          <button className="side-toggle" onClick={toggle}
+                  title={collapsed ? "Expand" : "Collapse"} aria-label="Toggle sidebar">
+            <span className="side-ic">{collapsed ? "»" : "«"}</span>
+            {!collapsed && <span className="side-label">Collapse</span>}
+          </button>
+        </div>
       </aside>
 
       <main className="content">

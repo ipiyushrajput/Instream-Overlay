@@ -19,17 +19,17 @@ log = logging.getLogger("overlay.defaults")
 # overlay_type -> (filename, label, source URL, placeholder drawbox chain)
 _DEFAULTS = {
     "lband": ("default_lband.png", "L-band",
-              "https://d2b0puv2znzrgu.cloudfront.net/l-band.png",
+              "https://d2b0puv2znzrgu.cloudfront.net/Overlays/l-band.png",
               "drawbox=x=0:y=0:w=460:h=1080:color=0x1E3A8A@0.88:t=fill,"
               "drawbox=x=0:y=780:w=1920:h=300:color=0x1E3A8A@0.88:t=fill"),
     "top_band": ("default_top_band.png", "Top band",
-                 "https://d2b0puv2znzrgu.cloudfront.net/top-band.png",
+                 "https://d2b0puv2znzrgu.cloudfront.net/Overlays/top-band.png",
                  "drawbox=x=0:y=0:w=1920:h=150:color=0x7C3AED@0.9:t=fill"),
     "bottom_band": ("default_bottom_band.png", "Bottom band",
-                    "https://d2b0puv2znzrgu.cloudfront.net/bottom-band.png",
+                    "https://d2b0puv2znzrgu.cloudfront.net/Overlays/bottom-band.png",
                     "drawbox=x=0:y=840:w=1920:h=240:color=0x059669@0.9:t=fill"),
     "pip": ("default_pip.png", "PIP ad",
-            "https://d2b0puv2znzrgu.cloudfront.net/pip.png",
+            "https://d2b0puv2znzrgu.cloudfront.net/Overlays/pip.png",
             "drawbox=x=0:y=0:w=1920:h=1080:color=0xB91C1C@0.96:t=fill"),
 }
 
@@ -40,7 +40,7 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 def _download(url: str, dest) -> bool:
     try:
-        with httpx.Client(follow_redirects=True, timeout=20,
+        with httpx.Client(follow_redirects=True, timeout=20, verify=False,
                           headers={"User-Agent": _UA, "Accept": "image/*,*/*"}) as c:
             r = c.get(url)
         r.raise_for_status()
