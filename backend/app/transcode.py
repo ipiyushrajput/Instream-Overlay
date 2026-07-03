@@ -40,18 +40,29 @@ def variant_video_params(v: VariantInfo) -> VideoParams:
 
 
 def _video_encoder(vp: VideoParams) -> list[str]:
-    """Codec-matched encoder args. HEVC is tagged hvc1 to match origin."""
+    """Codec-matched encoder args, tuned for fast single-segment encodes. HEVC is
+    tagged hvc1 to match origin. Each segment is a self-contained closed-GOP with
+    an IDR at the start, no B-frames and no lookahead, so it encodes quickly and
+    splices cleanly after an ``#EXT-X-DISCONTINUITY``."""
+    threads = str(config.ENCODER_THREADS)
     if vp.codec == "hevc":
         args = ["-c:v", "libx265", "-tag:v", "hvc1",
                 "-preset", config.ENCODER_PRESET, "-crf", str(config.ENCODER_CRF),
                 "-pix_fmt", vp.pix_fmt or "yuv420p"]
-        # Keep each segment self-contained (IDR at start, no open-GOP).
-        x265p = "no-open-gop=1:no-scenecut=1"
+        # Fast, self-contained segments: closed GOP, no scenecut/open-GOP, no
+        # B-frames, no lookahead; quiet the per-run x265 banner.
+        x265p = ("no-open-gop=1:no-scenecut=1:bframes=0:rc-lookahead=0:"
+                 "b-adapt=0:no-info=1:log-level=none")
+        if config.ENCODER_THREADS:
+            x265p += f":frame-threads={config.ENCODER_THREADS}"
         args += ["-x265-params", x265p]
         return args
     args = ["-c:v", "libx264", "-preset", config.ENCODER_PRESET,
+            "-tune", "zerolatency",
             "-crf", str(config.ENCODER_CRF), "-pix_fmt", vp.pix_fmt or "yuv420p",
-            "-sc_threshold", "0"]
+            "-sc_threshold", "0", "-bf", "0",
+            "-x264-params", "rc-lookahead=0:sync-lookahead=0:sliced-threads=0",
+            "-threads", threads]
     if vp.profile:
         args += ["-profile:v", vp.profile]
     if vp.x264_level:
@@ -60,11 +71,15 @@ def _video_encoder(vp: VideoParams) -> list[str]:
 
 
 def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
-                  overlay_type: str, offset: float, duration: float,
+                  overlay_type: str, event_offset: float, duration: float,
+                  seg_duration: float, mux_offset: float,
                   out_path: Path) -> list[str]:
     # Single filter_complex containing the squeeze video graph plus (optionally)
     # a matching audio-shift graph, so [outv]/[outa] are both defined.
-    graphs = build_squeeze_filter(vp, overlay_type, offset, duration,
+    # event_offset drives the easing/art fade (may be negative); mux_offset (>=0)
+    # keeps the segments of one event continuous in output PTS.
+    graphs = build_squeeze_filter(vp, overlay_type, event_offset, duration,
+                                  seg_duration,
                                   t_in=config.SQUEEZE_IN, t_out=config.SQUEEZE_OUT)
     maps = ["-map", "[outv]"]
     if vp.has_audio:
@@ -87,18 +102,19 @@ def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
     if vp.has_audio:
         cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
     # Shift output timestamps so segments inside one event are continuous.
-    cmd += ["-output_ts_offset", f"{offset:.4f}",
+    cmd += ["-output_ts_offset", f"{mux_offset:.4f}",
             "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", str(out_path)]
     return cmd
 
 
 async def transcode_segment(origin_url: str, overlay_image: str, vp: VideoParams,
-                            overlay_type: str, offset: float, duration: float,
+                            overlay_type: str, event_offset: float, duration: float,
+                            seg_duration: float, mux_offset: float,
                             out_path: Path) -> tuple[bool, str]:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(".tmp.ts")
     cmd = build_command(origin_url, overlay_image, vp, overlay_type,
-                        offset, duration, tmp)
+                        event_offset, duration, seg_duration, mux_offset, tmp)
     log.debug("ffmpeg cmd: %s", " ".join(cmd))
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

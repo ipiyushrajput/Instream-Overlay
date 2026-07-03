@@ -118,25 +118,58 @@ POCKETS = {
 }
 
 
-def _smoothstep_expr(duration: float, offset: float, t_in: float, t_out: float) -> str:
-    """Eased squeeze factor e(g) in [0,1]: ramps 0->1 over [0,t_in], holds, then
-    1->0 over [duration-t_out, duration]. ``g = t + offset`` is event-global time
-    (``t`` is the segment-local frame time; ``offset`` is the segment's position
-    within the event), so the animation is continuous across the event's
-    segments without shifting the actual compositing timeline."""
+def _smoothstep_expr(duration: float, event_offset: float,
+                     t_in: float, t_out: float) -> str:
+    """Eased squeeze factor e(g) in [0,1]: ramps 0->1 over event-global time
+    [0,t_in], holds, then 1->0 over [duration-t_out, duration].
+
+    ``g = t + event_offset`` is event-global time, where ``t`` is the
+    segment-local frame time and ``event_offset = (segment_start_pdt -
+    overlay_start_pdt)`` — which can be **negative** for the first covered
+    segment (it began slightly before the overlay window). Because clip() floors
+    at 0, a negative g simply yields e=0 until the true overlay start is reached
+    inside that segment, so the squeeze-in lands exactly at ``start_pdt`` and the
+    squeeze-out lands exactly at ``end_pdt`` regardless of segment alignment."""
     d_off = max(0.0, duration - t_out)
-    g = f"(t+{offset:.4f})"
+    g = f"(t+{event_offset:.4f})"
     s = (f"(clip({g}/{t_in:.3f},0,1)*"
          f"(1-clip(({g}-{d_off:.3f})/{t_out:.3f},0,1)))")
     return f"({s}*{s}*(3-2*{s}))"  # smoothstep
 
 
-def build_squeeze_filter(vp: VideoParams, overlay_type: str, offset: float,
-                         duration: float, t_in: float = 0.6, t_out: float = 0.6) -> str:
+def _art_alpha_chain(event_offset: float, duration: float, seg_duration: float,
+                     t_in: float, t_out: float) -> str:
+    """Per-segment ``fade`` alpha ops that make the overlay art appear/disappear
+    in lock-step with the squeeze factor E, so the band graphic is gone the
+    instant the video returns to full frame (fixes art lingering after the
+    squeeze-back). Fades are cheap; E's per-pixel gate would be far slower.
+
+    Event-global ramp regions are [0,t_in] (in) and [duration-t_out,duration]
+    (out); translated to this segment's local time via ``g = event_offset + τ``.
+    Only the ramp that actually intersects this segment is applied; hold-only
+    (middle) segments get full opacity, matching E holding at 1."""
+    ops = []
+    seg_end_g = event_offset + max(0.0, seg_duration)
+    # Ramp-in [0, t_in] intersects [event_offset, seg_end_g]?
+    if event_offset < t_in and seg_end_g > 0:
+        st = max(0.0, -event_offset)  # local time where g crosses 0
+        ops.append(f"fade=t=in:st={st:.4f}:d={t_in:.3f}:alpha=1")
+    # Ramp-out [duration-t_out, duration] intersects this segment?
+    out_start_g = duration - t_out
+    if seg_end_g > out_start_g and event_offset < duration:
+        st = max(0.0, out_start_g - event_offset)
+        ops.append(f"fade=t=out:st={st:.4f}:d={t_out:.3f}:alpha=1")
+    return ("," + ",".join(ops)) if ops else ""
+
+
+def build_squeeze_filter(vp: VideoParams, overlay_type: str, event_offset: float,
+                         duration: float, seg_duration: float,
+                         t_in: float = 0.6, t_out: float = 0.6) -> str:
     """ffmpeg ``-filter_complex`` that squeezes the main video (input #0) into
     the overlay pocket and composites the overlay/ad art (input #1), animated by
-    the eased factor e(t). ``offset`` is this segment's start time within the
-    event (so the animation is continuous across the event's segments).
+    the eased factor e(t). ``event_offset`` is this segment's start relative to
+    the overlay window start (may be negative); ``seg_duration`` is this
+    segment's own length, used to fade the art in/out in sync with the squeeze.
 
     Input pads: ``[0:v]`` video, ``[1:v]`` overlay image. Output pad: ``[outv]``.
     """
@@ -147,7 +180,8 @@ def build_squeeze_filter(vp: VideoParams, overlay_type: str, offset: float,
     Ht = max(2, round(H * fh))
     Xt = round(W * fx)
     Yt = round(H * fy)
-    E = _smoothstep_expr(duration, offset, t_in, t_out)
+    E = _smoothstep_expr(duration, event_offset, t_in, t_out)
+    alpha = _art_alpha_chain(event_offset, duration, seg_duration, t_in, t_out)
 
     # Keep the segment 0-based and aligned with the bg/art (no compositing gap);
     # cross-segment continuity is handled by -output_ts_offset at mux time.
@@ -160,7 +194,8 @@ def build_squeeze_filter(vp: VideoParams, overlay_type: str, offset: float,
 
     v = (f"[0:v]{pts},scale=w='{wexpr}':h='{hexpr}':eval=frame,setsar=1[v]")
     bg = f"color=c=black:s={W}x{H}:r={fps:g}[bg]"
-    art = f"[1:v]scale={W}:{H},format=rgba[art]"
+    # Art faded in/out with the squeeze so it never lingers over full-frame video.
+    art = f"[1:v]scale={W}:{H},format=rgba{alpha}[art]"
 
     if overlay_type == "pip":
         # Ad art behind, shrunken video on top.

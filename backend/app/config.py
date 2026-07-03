@@ -31,16 +31,28 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 # hls.js fetch our child manifests / overlaid segments from the right host.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
-# How far behind the live edge we hold our manifest, in segments. This is the
-# processing headroom that lets the worker transcode overlay segments before a
-# player ever requests them. The user explicitly accepts this added delay.
-BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 3)
+# How far behind the origin live edge we hold OUR output manifest, in segments.
+# This is the processing headroom that lets the worker transcode overlay segments
+# (across every variant) long before a player ever requests them. Bigger = safer
+# against buffering, at the cost of more end-to-end latency. Default ~60s at a 6s
+# target duration (the "1 minute gap between input and output" the operator wants).
+BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 10)
 # Extra hold-back segments when the origin is HEVC (libx265 encoding is heavier,
 # so it needs more lead time to avoid buffering during overlay transitions).
-HEVC_EXTRA_BUFFER = _int("OVERLAY_HEVC_EXTRA_BUFFER", 3)
+HEVC_EXTRA_BUFFER = _int("OVERLAY_HEVC_EXTRA_BUFFER", 2)
+# How many segments the OUTPUT live window exposes (its DVR depth). Kept small and
+# independent of the big hold-back so the oldest segment we reference still lives
+# inside the origin's DVR window (origin_window >= BUFFER + OUTPUT_WINDOW + margin).
+OUTPUT_WINDOW_SEGMENTS = _int("OVERLAY_OUTPUT_WINDOW", 6)
 
-# Max concurrent ffmpeg transcodes.
-MAX_TRANSCODE_WORKERS = _int("OVERLAY_MAX_WORKERS", 4)
+# How often the background pre-warm loop re-fetches each origin child playlist and
+# queues overlay transcodes for segments that just appeared (seconds).
+PREWARM_INTERVAL = float(os.environ.get("OVERLAY_PREWARM_INTERVAL", "1.5"))
+
+# Max concurrent ffmpeg transcodes. Overlay windows fan out one job per variant
+# per segment; enough workers to run all variants of a segment in parallel keeps
+# the all-variants-ready gate from serializing.
+MAX_TRANSCODE_WORKERS = _int("OVERLAY_MAX_WORKERS", 6)
 
 # httpx timeout (seconds) for fetching origin manifests/segments.
 ORIGIN_TIMEOUT = _int("OVERLAY_ORIGIN_TIMEOUT", 15)
@@ -53,6 +65,10 @@ FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 # a fast preset; raise quality (slower preset / lower CRF) if you have headroom.
 ENCODER_PRESET = os.environ.get("OVERLAY_ENCODER_PRESET", "ultrafast")
 ENCODER_CRF = _int("OVERLAY_ENCODER_CRF", 23)
+# Per-encode thread cap (0 = let ffmpeg choose). Short segments encode fastest
+# with a few threads each so several variants can run in parallel without
+# oversubscribing the CPU.
+ENCODER_THREADS = _int("OVERLAY_ENCODER_THREADS", 0)
 # Squeeze in/out animation durations (seconds).
 SQUEEZE_IN = float(os.environ.get("OVERLAY_SQUEEZE_IN", "0.6"))
 SQUEEZE_OUT = float(os.environ.get("OVERLAY_SQUEEZE_OUT", "0.6"))
