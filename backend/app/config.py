@@ -31,19 +31,15 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 # hls.js fetch our child manifests / overlaid segments from the right host.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
-# How far behind the origin live edge we hold OUR output manifest, in segments.
-# This is the processing headroom that lets the worker transcode overlay segments
-# (across every variant) long before a player ever requests them. Bigger = safer
-# against buffering, at the cost of more end-to-end latency. Default ~60s at a 6s
-# target duration (the "1 minute gap between input and output" the operator wants).
-BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 10)
+# How far behind the live edge we hold our manifest, in segments. This is the
+# processing headroom that lets the worker transcode overlay segments before a
+# player ever requests them. Kept small so the output window still mirrors the
+# origin's live window (a large hold-back on a shallow-window origin would leave
+# only 1-2 segments in our output and cause the player to rebuffer).
+BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 3)
 # Extra hold-back segments when the origin is HEVC (libx265 encoding is heavier,
 # so it needs more lead time to avoid buffering during overlay transitions).
-HEVC_EXTRA_BUFFER = _int("OVERLAY_HEVC_EXTRA_BUFFER", 2)
-# How many segments the OUTPUT live window exposes (its DVR depth). Kept small and
-# independent of the big hold-back so the oldest segment we reference still lives
-# inside the origin's DVR window (origin_window >= BUFFER + OUTPUT_WINDOW + margin).
-OUTPUT_WINDOW_SEGMENTS = _int("OVERLAY_OUTPUT_WINDOW", 6)
+HEVC_EXTRA_BUFFER = _int("OVERLAY_HEVC_EXTRA_BUFFER", 3)
 
 # How often the background pre-warm loop re-fetches each origin child playlist and
 # queues overlay transcodes for segments that just appeared (seconds).
