@@ -40,9 +40,7 @@ def build_ffmpeg_cmd(out: Path) -> list[str]:
         "-s:v:0", "1280x720", "-b:v:0", "3000k", "-maxrate:v:0", "3000k", "-bufsize:v:0", "6000k",
         "-s:v:1", "854x480", "-b:v:1", "1200k", "-maxrate:v:1", "1200k", "-bufsize:v:1", "2400k",
         "-s:v:2", "640x360", "-b:v:2", "700k", "-maxrate:v:2", "700k", "-bufsize:v:2", "1400k",
-        # Deep DVR window (30 x 6s = 180s) so segments still exist after our
-        # ~60s output hold-back references them.
-        "-f", "hls", "-hls_time", "6", "-hls_list_size", "30",
+        "-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
         "-hls_flags", "delete_segments+program_date_time+independent_segments",
         "-hls_segment_filename", str(out / "v%v" / "seg_%05d.ts"),
         "-master_pl_name", "master.m3u8",

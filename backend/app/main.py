@@ -166,13 +166,12 @@ def _effective_buffer(ch: Channel) -> int:
 
 
 def _min_lead_seconds(target_duration: int, ch: Optional[Channel] = None) -> int:
-    """Minimum lead before an overlay window starts. Must place the whole window
-    BEYOND the buffer hold-back (where pre-transcoding happens) with margin, so by
-    the time a covered segment reaches our held-back live edge every variant has
-    already been transcoded. Larger effective buffer (HEVC) pushes this out."""
+    """Minimum lead before an overlay window starts. Must cover the buffer
+    hold-back (where transcoding happens) plus margin. The squeeze + codec-match
+    (HEVC) encode is heavier, so the effective buffer is larger for HEVC."""
     td = target_duration or 6
     buf = _effective_buffer(ch) if ch is not None else config.BUFFER_SEGMENTS
-    return int((buf + 2) * td)
+    return int((buf + 1) * td)
 
 
 log = logging.getLogger("overlay.api")
@@ -896,9 +895,8 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
         return ("origin", seg.uri, None)
 
     before_max = tl.max_frozen_seq
-    # Output DVR depth is kept small and independent of the big hold-back, so the
-    # oldest segment we reference still lives inside the origin's window.
-    window_size = min(len(pl.segments) or 1, config.OUTPUT_WINDOW_SEGMENTS)
+    # Mirror the origin's window length so the output isn't shorter than origin.
+    window_size = len(pl.segments) or 1
     tl.advance(pl.segments, _effective_buffer(ch), decide, window_size)
     out = tl.render(pl.discontinuity_sequence, pl.target_duration,
                     version=pl.version, header_extra=pl.header_extra)
