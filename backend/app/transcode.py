@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Optional
 
 from . import config
 from .codecs import VideoParams, build_squeeze_filter
@@ -39,11 +40,39 @@ def variant_video_params(v: VariantInfo) -> VideoParams:
     )
 
 
+def _hw_video_encoder(vp: VideoParams) -> Optional[list[str]]:
+    """Optional hardware encoder args (NVIDIA NVENC / Intel QSV), selected by
+    OVERLAY_HWACCEL. Returns None for the default software path. These accept the
+    CPU-filtered frames directly (no hwupload needed) and are tagged hvc1 for
+    HEVC so the segment still splices cleanly. Low-latency presets keep each
+    short segment self-contained (single IDR, no B-frames/lookahead)."""
+    hw = config.HWACCEL
+    q = str(config.ENCODER_CRF)
+    pix = vp.pix_fmt or "yuv420p"
+    if hw == "nvenc":
+        if vp.codec == "hevc":
+            return ["-c:v", "hevc_nvenc", "-tag:v", "hvc1", "-preset", "p1",
+                    "-tune", "ll", "-rc", "vbr", "-cq", q, "-bf", "0",
+                    "-g", "300", "-pix_fmt", pix]
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll",
+                "-rc", "vbr", "-cq", q, "-bf", "0", "-g", "300", "-pix_fmt", pix]
+    if hw == "qsv":
+        if vp.codec == "hevc":
+            return ["-c:v", "hevc_qsv", "-tag:v", "hvc1", "-preset", "veryfast",
+                    "-global_quality", q, "-bf", "0", "-look_ahead", "0"]
+        return ["-c:v", "h264_qsv", "-preset", "veryfast",
+                "-global_quality", q, "-bf", "0", "-look_ahead", "0"]
+    return None
+
+
 def _video_encoder(vp: VideoParams) -> list[str]:
     """Codec-matched encoder args, tuned for fast single-segment encodes. HEVC is
     tagged hvc1 to match origin. Each segment is a self-contained closed-GOP with
     an IDR at the start, no B-frames and no lookahead, so it encodes quickly and
     splices cleanly after an ``#EXT-X-DISCONTINUITY``."""
+    hw = _hw_video_encoder(vp)
+    if hw is not None:
+        return hw
     threads = str(config.ENCODER_THREADS)
     if vp.codec == "hevc":
         args = ["-c:v", "libx265", "-tag:v", "hvc1",

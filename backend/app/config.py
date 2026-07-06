@@ -65,6 +65,13 @@ ENCODER_CRF = _int("OVERLAY_ENCODER_CRF", 23)
 # with a few threads each so several variants can run in parallel without
 # oversubscribing the CPU.
 ENCODER_THREADS = _int("OVERLAY_ENCODER_THREADS", 0)
+# Optional hardware video encoder for the overlay segments. Default "none" keeps
+# the (verified) software libx264/libx265 path unchanged. Set to a GPU your
+# machine actually has — "nvenc" (NVIDIA), "qsv" (Intel Quick Sync) — to offload
+# the encode and cut transcode time on a slow CPU. Both accept CPU-filtered
+# frames as-is, so no filter changes are needed. Falls back to software if the
+# hardware encoder is unavailable at runtime.
+HWACCEL = os.environ.get("OVERLAY_HWACCEL", "none").strip().lower()
 # Squeeze in/out animation durations (seconds).
 SQUEEZE_IN = float(os.environ.get("OVERLAY_SQUEEZE_IN", "0.6"))
 SQUEEZE_OUT = float(os.environ.get("OVERLAY_SQUEEZE_OUT", "0.6"))

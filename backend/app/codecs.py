@@ -192,15 +192,21 @@ def build_squeeze_filter(vp: VideoParams, overlay_type: str, event_offset: float
     yexpr = f"({E})*{Yt}"
     fps = vp.fps or 30
 
-    v = (f"[0:v]{pts},scale=w='{wexpr}':h='{hexpr}':eval=frame,setsar=1[v]")
+    # fast_bilinear is markedly cheaper than the default scaler and imperceptible
+    # for the moving squeeze; only the animated pocket scale needs per-frame eval.
+    v = (f"[0:v]{pts},scale=w='{wexpr}':h='{hexpr}':eval=frame:flags=fast_bilinear,"
+         f"setsar=1[v]")
     bg = f"color=c=black:s={W}x{H}:r={fps:g}[bg]"
     # Art faded in/out with the squeeze so it never lingers over full-frame video.
-    art = f"[1:v]scale={W}:{H},format=rgba{alpha}[art]"
+    art = f"[1:v]scale={W}:{H}:flags=fast_bilinear,format=rgba{alpha}[art]"
 
     if overlay_type == "pip":
-        # Ad art behind, shrunken video on top.
+        # Ad art behind, shrunken video on top. The art sits at a fixed 0:0, so it
+        # needs no per-frame expression eval; only the moving video does.
         return (f"{v};{bg};{art};[bg][art]overlay=0:0:shortest=1[base];"
                 f"[base][v]overlay=x='{xexpr}':y='{yexpr}':eval=frame:shortest=1[outv]")
     # Bands: video on black, band art on top (its transparent center reveals video).
-    return (f"{v};{bg};{art};[bg][v]overlay=x='{xexpr}':y='{yexpr}':eval=frame:shortest=1[m];"
-            f"[m][art]overlay=0:0:eval=frame:shortest=1[outv]")
+    # The band art overlay is static at 0:0 (its time-varying alpha is baked into
+    # [art] via fade), so it does not need eval=frame — only the pocket does.
+    return (f"{v};{bg};[bg][v]overlay=x='{xexpr}':y='{yexpr}':eval=frame:shortest=1[m];"
+            f"{art};[m][art]overlay=0:0:shortest=1[outv]")
