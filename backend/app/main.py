@@ -27,6 +27,10 @@ from .worker import Job, JobStatus, pool
 
 # Per-(channel, variant) frozen-decision timelines.
 _timelines: dict[tuple, VariantTimeline] = {}
+# Per-(channel, rendition idx) timelines. Each audio/subtitle rendition advances
+# on its OWN request cadence (never coupled to a specific video variant being
+# polled) while sharing the same buffer hold-back as video.
+_rendition_timelines: dict[tuple, VariantTimeline] = {}
 
 
 def _timeline(channel_id: str, variant_index: int) -> VariantTimeline:
@@ -36,11 +40,18 @@ def _timeline(channel_id: str, variant_index: int) -> VariantTimeline:
     return _timelines[key]
 
 
+def _rendition_timeline(channel_id: str, idx: int) -> VariantTimeline:
+    key = (channel_id, idx)
+    if key not in _rendition_timelines:
+        _rendition_timelines[key] = VariantTimeline()
+    return _rendition_timelines[key]
+
+
 def _drop_timelines(channel_id: str) -> None:
     for key in [k for k in _timelines if k[0] == channel_id]:
         _timelines.pop(key, None)
-    for key in [k for k in _rendition_segs if k[0] == channel_id]:
-        _rendition_segs.pop(key, None)
+    for key in [k for k in _rendition_timelines if k[0] == channel_id]:
+        _rendition_timelines.pop(key, None)
     _synth_pdt.pop(channel_id, None)
 
 
@@ -48,11 +59,6 @@ def _drop_timelines(channel_id: str) -> None:
 # no PDT at all. Assigned once per segment from the wall clock and reused so the
 # value is stable across reloads (required for playlist immutability).
 _synth_pdt: dict[str, dict[int, str]] = {}
-
-# Remembered rendition segment URLs/tags by seq (keyed by (channel, idx)) so we
-# can serve the same buffer-held window the video timeline exposes even after
-# the origin rendition playlist scrolls those segments off.
-_rendition_segs: dict[tuple, dict[int, tuple]] = {}
 
 
 def _ensure_pdt(channel_id: str, pl) -> bool:
@@ -590,18 +596,6 @@ async def delete_channel_ep(channel_id: str):
 
 # --- rendition (audio / subtitle) mirroring --------------------------------
 
-def _reconstruct_seg_url(template: str, seq: int) -> Optional[str]:
-    """Build a rendition segment URL for ``seq`` from a sibling URL template by
-    replacing its trailing numeric run (e.g. seg_0115651.vtt -> seg_0115660.vtt),
-    preserving zero-padding. Used when a needed seq is no longer in the origin
-    playlist window."""
-    m = re.search(r"(\d+)(\.\w+)$", template)
-    if not m:
-        return None
-    width = len(m.group(1))
-    return template[:m.start(1)] + str(seq).zfill(width) + m.group(2)
-
-
 def _rendition_name(r: dict) -> str:
     """Stable slug for a rendition URL. Older channels (persisted before the
     name field existed) get one derived from their EXT-X-MEDIA line."""
@@ -629,13 +623,16 @@ def _find_rendition(ch, rname: str) -> Optional[dict]:
 
 
 async def _render_rendition(channel_id: str, rname: str):
-    """Mirror an audio/subtitle rendition, kept in lock-step with the video.
+    """Serve an audio/subtitle rendition, buffer-aligned with the video.
 
-    Renditions must stay aligned with the video variants (same MEDIA-SEQUENCE,
-    DISCONTINUITY-SEQUENCE, discontinuity positions, PDT and buffer hold-back) or
-    the player buffers/desyncs. We therefore render the rendition through the
-    *video* timeline's frozen structure, substituting the origin rendition's own
-    (absolute) segment URLs — no transcoding, no overlay."""
+    Each rendition advances its OWN frozen timeline whenever it is requested,
+    applying the same buffer hold-back as the video variants. Because the origin
+    already aligns the rendition and video segments (same PROGRAM-DATE-TIME and
+    sequence numbers), the two held-back windows line up by wall-clock time — but
+    crucially the rendition no longer depends on any single video variant's
+    timeline being polled, so it can't freeze when the player is on a different
+    ABR level (which previously stuck the subtitle at a fixed MEDIA-SEQUENCE).
+    Renditions are never transcoded, so every segment decision is 'origin'."""
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
@@ -648,38 +645,17 @@ async def _render_rendition(channel_id: str, rname: str):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"rendition fetch failed: {exc}")
     sub_pl = manifest.parse_media(text, rend["origin_uri"])  # absolute seg URIs
+    _ensure_pdt(f"{channel_id}#r{idx}", sub_pl)  # namespaced so it can't clash with video
 
-    # Remember every seq we see so we can serve older buffer-held segments too.
-    mem = _rendition_segs.setdefault((channel_id, idx), {})
-    template = sub_pl.segments[0].uri if sub_pl.segments else None
-    for s in sub_pl.segments:
-        mem[s.seq] = (s.uri, s.tags)
+    tl = _rendition_timeline(channel_id, idx)
 
-    # Mirror the video variant-0 timeline so both stay perfectly aligned.
-    tl = _timeline(channel_id, 0)
-    if not tl.frozen:
-        # Video hasn't been requested yet — serve the origin rendition as-is.
-        for s in [s for s in mem if s < (sub_pl.media_sequence - 200)]:
-            mem.pop(s, None)
-        return PlainTextResponse(manifest.render_media(sub_pl),
-                                 media_type="application/vnd.apple.mpegurl")
+    def decide(seg):
+        return ("origin", seg.uri, None)  # renditions pass through, never overlaid
 
-    def uri_for(seq: int) -> Optional[str]:
-        e = mem.get(seq)
-        if e:
-            return e[0]
-        return _reconstruct_seg_url(template, seq) if template else None
-
-    def tags_for(seq: int):
-        e = mem.get(seq)
-        return e[1] if e else []
-
+    window_size = len(sub_pl.segments) or 1
+    tl.advance(sub_pl.segments, _effective_buffer(ch), decide, window_size)
     out = tl.render(sub_pl.discontinuity_sequence, sub_pl.target_duration,
-                    version=sub_pl.version, header_extra=sub_pl.header_extra,
-                    uri_for=uri_for, tags_for=tags_for)
-    # Prune remembered entries well below the rendered window.
-    for s in [s for s in mem if s < out.media_sequence - 200]:
-        mem.pop(s, None)
+                    version=sub_pl.version, header_extra=sub_pl.header_extra)
     return PlainTextResponse(manifest.render_media(out),
                              media_type="application/vnd.apple.mpegurl")
 
