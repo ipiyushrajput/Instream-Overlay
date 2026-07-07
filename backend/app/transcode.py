@@ -65,14 +65,16 @@ def _hw_video_encoder(vp: VideoParams) -> Optional[list[str]]:
     return None
 
 
-def _video_encoder(vp: VideoParams) -> list[str]:
+def _video_encoder(vp: VideoParams, use_hw: bool = True) -> list[str]:
     """Codec-matched encoder args, tuned for fast single-segment encodes. HEVC is
     tagged hvc1 to match origin. Each segment is a self-contained closed-GOP with
     an IDR at the start, no B-frames and no lookahead, so it encodes quickly and
-    splices cleanly after an ``#EXT-X-DISCONTINUITY``."""
-    hw = _hw_video_encoder(vp)
-    if hw is not None:
-        return hw
+    splices cleanly after an ``#EXT-X-DISCONTINUITY``. ``use_hw=False`` forces the
+    software path (used to retry when a hardware encode fails)."""
+    if use_hw:
+        hw = _hw_video_encoder(vp)
+        if hw is not None:
+            return hw
     threads = str(config.ENCODER_THREADS)
     if vp.codec == "hevc":
         args = ["-c:v", "libx265", "-tag:v", "hvc1",
@@ -102,7 +104,7 @@ def _video_encoder(vp: VideoParams) -> list[str]:
 def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
                   overlay_type: str, event_offset: float, duration: float,
                   seg_duration: float, mux_offset: float,
-                  out_path: Path) -> list[str]:
+                  out_path: Path, use_hw: bool = True) -> list[str]:
     # Single filter_complex containing the squeeze video graph plus (optionally)
     # a matching audio-shift graph, so [outv]/[outa] are both defined.
     # event_offset drives the easing/art fade (may be negative); mux_offset (>=0)
@@ -124,7 +126,7 @@ def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
         "-filter_complex", graphs,
         *maps,
         "-force_key_frames", "expr:eq(n,0)",  # IDR at segment start
-        *_video_encoder(vp),
+        *_video_encoder(vp, use_hw=use_hw),
     ]
     if vp.fps:
         cmd += ["-r", f"{vp.fps:g}"]
@@ -136,14 +138,7 @@ def build_command(origin_url: str, overlay_image: str, vp: VideoParams,
     return cmd
 
 
-async def transcode_segment(origin_url: str, overlay_image: str, vp: VideoParams,
-                            overlay_type: str, event_offset: float, duration: float,
-                            seg_duration: float, mux_offset: float,
-                            out_path: Path) -> tuple[bool, str]:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(".tmp.ts")
-    cmd = build_command(origin_url, overlay_image, vp, overlay_type,
-                        event_offset, duration, seg_duration, mux_offset, tmp)
+async def _run_ffmpeg(cmd: list[str], tmp: Path, out_path: Path) -> tuple[bool, str]:
     log.debug("ffmpeg cmd: %s", " ".join(cmd))
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -151,8 +146,32 @@ async def transcode_segment(origin_url: str, overlay_image: str, vp: VideoParams
     if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
         tmp.unlink(missing_ok=True)
         err = stderr.decode("utf-8", "replace")
-        log.warning("ffmpeg FAILED rc=%s origin=%s\n  cmd: %s\n  stderr: %s",
-                    proc.returncode, origin_url, " ".join(cmd), err[-1500:])
         return False, err[-2000:]
     tmp.replace(out_path)
     return True, ""
+
+
+async def transcode_segment(origin_url: str, overlay_image: str, vp: VideoParams,
+                            overlay_type: str, event_offset: float, duration: float,
+                            seg_duration: float, mux_offset: float,
+                            out_path: Path) -> tuple[bool, str]:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".tmp.ts")
+    use_hw = config.HWACCEL in ("nvenc", "qsv")
+    cmd = build_command(origin_url, overlay_image, vp, overlay_type,
+                        event_offset, duration, seg_duration, mux_offset, tmp,
+                        use_hw=use_hw)
+    ok, err = await _run_ffmpeg(cmd, tmp, out_path)
+    if not ok and use_hw:
+        # Hardware encode failed (missing/misconfigured GPU, unsupported params) —
+        # retry this segment in software so overlays still appear.
+        log.warning("HW encode (%s) failed for %s, retrying in software: %s",
+                    config.HWACCEL, origin_url, err[-400:])
+        cmd = build_command(origin_url, overlay_image, vp, overlay_type,
+                            event_offset, duration, seg_duration, mux_offset, tmp,
+                            use_hw=False)
+        ok, err = await _run_ffmpeg(cmd, tmp, out_path)
+    if not ok:
+        log.warning("ffmpeg FAILED origin=%s\n  cmd: %s\n  stderr: %s",
+                    origin_url, " ".join(cmd), err[-1500:])
+    return ok, err

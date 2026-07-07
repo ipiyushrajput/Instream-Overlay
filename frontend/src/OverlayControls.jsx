@@ -13,7 +13,7 @@ export default function OverlayControls({ channelId, minLead, onChange, onLog })
   const [image, setImage] = useState(null);      // {image_filename, url}
   const [type, setType] = useState("lband");
   const [startIn, setStartIn] = useState(minLead || 24);
-  const [duration, setDuration] = useState(30);
+  const [duration, setDuration] = useState(10);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const fileRef = useRef(null);

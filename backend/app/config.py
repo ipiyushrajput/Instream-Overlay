@@ -29,14 +29,14 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 
 # Public base URL of THIS backend, used when rewriting manifests so players and
 # hls.js fetch our child manifests / overlaid segments from the right host.
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://107.109.131.68:8000").rstrip("/")
 
 # How far behind the live edge we hold our manifest, in segments. This is the
 # processing headroom that lets the worker transcode overlay segments before a
 # player ever requests them. Kept small so the output window still mirrors the
 # origin's live window (a large hold-back on a shallow-window origin would leave
 # only 1-2 segments in our output and cause the player to rebuffer).
-BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 3)
+BUFFER_SEGMENTS = _int("OVERLAY_BUFFER_SEGMENTS", 6)
 # Extra hold-back segments when the origin is HEVC (libx265 encoding is heavier,
 # so it needs more lead time to avoid buffering during overlay transitions).
 HEVC_EXTRA_BUFFER = _int("OVERLAY_HEVC_EXTRA_BUFFER", 3)
@@ -60,18 +60,17 @@ FFPROBE = os.environ.get("FFPROBE_BIN", "ffprobe")
 # animation + matching the origin codec (esp. HEVC) is CPU-heavy, so default to
 # a fast preset; raise quality (slower preset / lower CRF) if you have headroom.
 ENCODER_PRESET = os.environ.get("OVERLAY_ENCODER_PRESET", "ultrafast")
-ENCODER_CRF = _int("OVERLAY_ENCODER_CRF", 23)
+ENCODER_CRF = _int("OVERLAY_ENCODER_CRF", 28)
 # Per-encode thread cap (0 = let ffmpeg choose). Short segments encode fastest
 # with a few threads each so several variants can run in parallel without
 # oversubscribing the CPU.
-ENCODER_THREADS = _int("OVERLAY_ENCODER_THREADS", 0)
-# Optional hardware video encoder for the overlay segments. Default "none" keeps
-# the (verified) software libx264/libx265 path unchanged. Set to a GPU your
-# machine actually has — "nvenc" (NVIDIA), "qsv" (Intel Quick Sync) — to offload
-# the encode and cut transcode time on a slow CPU. Both accept CPU-filtered
-# frames as-is, so no filter changes are needed. Falls back to software if the
-# hardware encoder is unavailable at runtime.
-HWACCEL = os.environ.get("OVERLAY_HWACCEL", "none").strip().lower()
+ENCODER_THREADS = _int("OVERLAY_ENCODER_THREADS", 1)
+# Optional hardware video encoder for the overlay segments. "none" uses the
+# software libx264/libx265 path; "nvenc" (NVIDIA) / "qsv" (Intel Quick Sync)
+# offload the encode to the GPU to cut transcode time on a slow CPU. Both accept
+# CPU-filtered frames as-is, so no filter changes are needed, and if the hardware
+# encode fails at runtime we automatically retry that segment in software.
+HWACCEL = os.environ.get("OVERLAY_HWACCEL", "qsv").strip().lower()
 # Squeeze in/out animation durations (seconds).
 SQUEEZE_IN = float(os.environ.get("OVERLAY_SQUEEZE_IN", "0.6"))
 SQUEEZE_OUT = float(os.environ.get("OVERLAY_SQUEEZE_OUT", "0.6"))
