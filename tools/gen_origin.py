@@ -9,7 +9,7 @@ EXT-X-PROGRAM-DATE-TIME, then serves the output directory over HTTP with CORS.
 
     python tools/gen_origin.py --port 8100 --dir /tmp/origin
 
-Master playlist: http://127.0.0.1:8100/master.m3u8
+Master playlist: http://107.109.131.68:8100/master.m3u8
 """
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def main() -> int:
 
     handler = functools.partial(CORSHandler, directory=str(out))
     httpd = http.server.ThreadingHTTPServer(("0.0.0.0", args.port), handler)
-    print(f"Origin serving http://127.0.0.1:{args.port}/master.m3u8 (dir={out})")
+    print(f"Origin serving http://107.109.131.68:{args.port}/master.m3u8 (dir={out})")
 
     def shutdown(*_):
         ff.terminate()

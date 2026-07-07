@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api.js";
 
-const DEFAULT_ORIGIN = "http://127.0.0.1:8100/master.m3u8";
+const DEFAULT_ORIGIN = "http://107.109.131.68:8100/master.m3u8";
 
 export default function Register() {
   const [name, setName] = useState("");

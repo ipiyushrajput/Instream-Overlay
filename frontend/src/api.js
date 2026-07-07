@@ -1,6 +1,6 @@
 // Backend base URL. Override at build/run time with VITE_API_BASE.
 export const API_BASE =
-  import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+  import.meta.env.VITE_API_BASE || "http://107.109.131.68:8000";
 
 async function req(method, path, body) {
   const res = await fetch(`${API_BASE}${path}`, {
