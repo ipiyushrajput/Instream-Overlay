@@ -622,18 +622,6 @@ def _find_rendition(ch, rname: str) -> Optional[dict]:
     return None
 
 
-def _video_decided_upto(channel_id: str) -> int:
-    """Highest segment sequence any video variant of this channel has already
-    frozen a decision for. Used to keep a rendition from freezing a segment
-    *ahead* of the video, so its discontinuities can never contradict the
-    video's. -1 when no video variant has been polled yet."""
-    m = -1
-    for (cid, _vi), tl in _timelines.items():
-        if cid == channel_id and tl.max_frozen_seq > m:
-            m = tl.max_frozen_seq
-    return m
-
-
 async def _render_rendition(channel_id: str, rname: str):
     """Serve an audio/subtitle rendition, aligned with the video — including its
     discontinuities.
@@ -667,25 +655,22 @@ async def _render_rendition(channel_id: str, rname: str):
 
     tl = _rendition_timeline(channel_id, idx)
     overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
-    injected_seqs = store.injected_seqs_for_channel(channel_id)
-    video_upto = _video_decided_upto(channel_id)
 
     def decide(seg):
-        # Mirror the video's discontinuity exactly, by sequence number: emit an
-        # 'overlay' beat (origin url, no transcode) wherever the video overlaid.
-        if seg.seq in injected_seqs:
-            return ("overlay", seg.uri, None)
-        # Not overlaid. If this seq isn't inside any overlay window, it's plainly
-        # origin — freeze it now without waiting on the video.
+        # Follow the video's single authoritative decision for this seq, so the
+        # discontinuity lands on exactly the same segment as the video (keyed on
+        # sequence number, not PDT). The rendition segment is always the origin's
+        # own — an 'overlay' beat here just carries the matching discontinuity.
+        committed, ov_id = store.peek_seq_decision(channel_id, seg.seq)
+        if committed:
+            return ("overlay", seg.uri, None) if ov_id else ("origin", seg.uri, None)
+        # The video hasn't committed this seq yet. If it's not inside any overlay
+        # window it's plainly origin — freeze now without waiting. Otherwise wait
+        # so we never freeze a discontinuity decision ahead of the video
+        # (advance() falls back to origin after its max_wait if the video never
+        # decides here, e.g. video not being played).
         if _overlay_covering(overlays, seg) is None:
             return ("origin", seg.uri, None)
-        # Covered by an overlay window but not (yet) injected. If the video has
-        # already decided this seq, it chose to skip the overlay here -> origin.
-        if seg.seq <= video_upto:
-            return ("origin", seg.uri, None)
-        # The video hasn't decided this seq yet: wait so we never freeze a
-        # discontinuity decision ahead of it (advance() falls back to origin after
-        # its max_wait if the video never overlays here, e.g. video not playing).
         return None
 
     window_size = len(sub_pl.segments) or 1
@@ -899,10 +884,16 @@ async def serve_child(channel_id: str, session_id: str, variant_index: int):
         pool.ensure(_make_overlay_job(channel_id, variant_index, vp, seg, ov,
                                       anchors.get(ov.id)))
         ready, nready = _all_variants_ready(ch, ov.id, seg.seq)
-        if ready:
-            store.mark_injected(ov.id, seg.seq)
-            rel = f"/segment/{channel_id}/{variant_index}/{ov.id}/{seg.seq}.ts"
-            return ("overlay", rel, ov.id)
+        # The first variant to freeze this seq commits the decision (overlay id
+        # when all variants are ready, else origin); every other variant AND the
+        # audio/subtitle renditions follow that same committed decision, so the
+        # #EXT-X-DISCONTINUITY lands on the same segment everywhere.
+        decided = store.record_seq_decision(channel_id, seg.seq,
+                                            ov.id if ready else None)
+        if decided is not None:
+            store.mark_injected(decided, seg.seq)
+            rel = f"/segment/{channel_id}/{variant_index}/{decided}/{seg.seq}.ts"
+            return ("overlay", rel, decided)
         _log_skip(channel_id, ov.id, seg.seq, nready, len(ch.variants))
         return ("origin", seg.uri, None)
 

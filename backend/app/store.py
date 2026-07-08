@@ -31,6 +31,11 @@ class Store:
         self._channels: dict[str, Channel] = {}
         self._overlays: dict[str, OverlayEvent] = {}
         self._injected: dict[str, set] = {}   # overlay_id -> set of injected seqs
+        # channel_id -> {seq -> overlay_id or None}: the single authoritative
+        # overlay/origin decision per segment, committed by the first video
+        # variant to freeze that seq. All other variants and the audio/subtitle
+        # renditions follow it, so every variant agrees on discontinuity placement.
+        self._seq_overlay: dict[str, dict[int, "str | None"]] = {}
         self._sessions: list[dict] = []       # viewer sessions (master hits)
         self._deliveries: dict[str, dict] = {}  # overlay_id -> delivery record
 
@@ -109,6 +114,7 @@ class Store:
                 self._injected.pop(oid, None)
                 self._deliveries.pop(oid, None)
             self._sessions = [s for s in self._sessions if s.get("channel_id") != channel_id]
+            self._seq_overlay.pop(channel_id, None)
         db.delete_channel(channel_id)
         db.delete_channel_sessions(channel_id)
         return existed
@@ -140,18 +146,27 @@ class Store:
     def injected_count(self, overlay_id: str) -> int:
         return len(self._injected.get(overlay_id, ()))
 
-    def injected_seqs_for_channel(self, channel_id: str) -> set:
-        """Union of every segment sequence the video actually overlaid for this
-        channel. Used so audio/subtitle renditions can place an
-        #EXT-X-DISCONTINUITY at exactly the same sequence numbers as the video
-        (they carry no transcoded segment, just the matching discontinuity)."""
-        out: set = set()
+    def record_seq_decision(self, channel_id: str, seq: int,
+                            overlay_id: "str | None") -> "str | None":
+        """Commit the overlay/origin decision for one segment sequence, first
+        writer wins, and return the effective (committed) decision. The first
+        video variant to freeze ``seq`` decides whether it's overlaid (returns the
+        overlay id) or plain origin (None); later variants pass their own guess
+        but get back the committed value, so all variants stay consistent."""
         with self._lock:
-            for oid, seqs in self._injected.items():
-                ov = self._overlays.get(oid)
-                if ov is not None and ov.channel_id == channel_id:
-                    out |= seqs
-        return out
+            d = self._seq_overlay.setdefault(channel_id, {})
+            if seq not in d:
+                d[seq] = overlay_id
+                if len(d) > 4000:  # keep bounded: drop the oldest sequences
+                    for s in sorted(d)[:len(d) - 3000]:
+                        d.pop(s, None)
+            return d[seq]
+
+    def peek_seq_decision(self, channel_id: str, seq: int) -> "tuple[bool, str | None]":
+        """(committed?, overlay_id). Renditions read this to mirror the video's
+        discontinuities exactly, waiting until the video has committed the seq."""
+        d = self._seq_overlay.get(channel_id, {})
+        return (seq in d, d.get(seq))
 
 
 def new_id() -> str:
