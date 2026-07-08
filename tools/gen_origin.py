@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -62,7 +63,7 @@ class CORSHandler(http.server.SimpleHTTPRequestHandler):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8100)
-    ap.add_argument("--dir", default="/tmp/instream-origin")
+    ap.add_argument("--dir", default=str(Path(tempfile.gettempdir()) / "instream-origin"))
     args = ap.parse_args()
 
     if not shutil.which("ffmpeg"):
