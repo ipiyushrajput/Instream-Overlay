@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import os
-import tempfile
 from pathlib import Path
 
 # Repo root = .../<repo>/backend/app/config.py -> parents[2]
@@ -23,10 +22,8 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-# Where transcoded overlay segments and uploaded overlay images live. Defaults to
-# the OS temp dir (/tmp on Linux/macOS, %TEMP% on Windows) so it works on any host.
-DATA_DIR = Path(os.environ.get(
-    "OVERLAY_DATA_DIR", str(Path(tempfile.gettempdir()) / "instream-overlay-data")))
+# Where transcoded overlay segments and uploaded overlay images live.
+DATA_DIR = Path(os.environ.get("OVERLAY_DATA_DIR", "/tmp/instream-overlay-data"))
 SEGMENT_DIR = DATA_DIR / "segments"
 UPLOAD_DIR = DATA_DIR / "uploads"
 
