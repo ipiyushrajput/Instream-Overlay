@@ -4,11 +4,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+# On Windows, asyncio needs the Proactor event loop to spawn subprocesses
+# (ffmpeg). It is the default on Python 3.8+, but set it explicitly so the
+# transcoder works no matter how the app is launched. No-op on other platforms.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import httpx
 from fastapi import (FastAPI, File, HTTPException, Request, UploadFile, WebSocket,
