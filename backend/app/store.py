@@ -162,12 +162,6 @@ class Store:
                         d.pop(s, None)
             return d[seq]
 
-    def peek_seq_decision(self, channel_id: str, seq: int) -> "tuple[bool, str | None]":
-        """(committed?, overlay_id). Renditions read this to mirror the video's
-        discontinuities exactly, waiting until the video has committed the seq."""
-        d = self._seq_overlay.get(channel_id, {})
-        return (seq in d, d.get(seq))
-
 
 def new_id() -> str:
     return uuid.uuid4().hex[:24]

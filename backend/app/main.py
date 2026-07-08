@@ -27,10 +27,13 @@ from .worker import Job, JobStatus, pool
 
 # Per-(channel, variant) frozen-decision timelines.
 _timelines: dict[tuple, VariantTimeline] = {}
-# Per-(channel, rendition idx) timelines. Each audio/subtitle rendition advances
-# on its OWN request cadence (never coupled to a specific video variant being
-# polled) while sharing the same buffer hold-back as video.
+# Per-(channel, rendition idx) fallback timelines, used only before any video
+# variant has been polled (so a rendition still holds back by the buffer).
 _rendition_timelines: dict[tuple, VariantTimeline] = {}
+# Remembered rendition segment URLs/tags by seq (keyed by (channel, idx)) so a
+# rendition can supply a URL for any seq in the mirrored video window, even after
+# the origin rendition playlist scrolls that seq off.
+_rendition_segs: dict[tuple, dict[int, tuple]] = {}
 
 
 def _timeline(channel_id: str, variant_index: int) -> VariantTimeline:
@@ -47,11 +50,39 @@ def _rendition_timeline(channel_id: str, idx: int) -> VariantTimeline:
     return _rendition_timelines[key]
 
 
+def _most_advanced_video_timeline(channel_id: str) -> Optional[VariantTimeline]:
+    """The video variant timeline that has frozen the furthest — i.e. the one the
+    player is actively polling. Renditions mirror THIS timeline's exact frozen
+    structure (discontinuities, DISCONTINUITY-SEQUENCE, MEDIA-SEQUENCE), so they
+    can never disagree with the video, and they follow whichever ABR level is
+    playing instead of freezing on a fixed variant that isn't being requested."""
+    best = None
+    for (cid, _vi), tl in _timelines.items():
+        if cid == channel_id and tl.frozen:
+            if best is None or tl.max_frozen_seq > best.max_frozen_seq:
+                best = tl
+    return best
+
+
+def _reconstruct_seg_url(template: str, seq: int) -> Optional[str]:
+    """Build a rendition segment URL for ``seq`` from a sibling URL template by
+    replacing its trailing numeric run (e.g. seg_0115651.vtt -> seg_0115660.vtt),
+    preserving zero-padding. Used when a needed seq is no longer in the origin
+    rendition window but is still inside the mirrored video window."""
+    m = re.search(r"(\d+)(\.\w+)$", template)
+    if not m:
+        return None
+    width = len(m.group(1))
+    return template[:m.start(1)] + str(seq).zfill(width) + m.group(2)
+
+
 def _drop_timelines(channel_id: str) -> None:
     for key in [k for k in _timelines if k[0] == channel_id]:
         _timelines.pop(key, None)
     for key in [k for k in _rendition_timelines if k[0] == channel_id]:
         _rendition_timelines.pop(key, None)
+    for key in [k for k in _rendition_segs if k[0] == channel_id]:
+        _rendition_segs.pop(key, None)
     _synth_pdt.pop(channel_id, None)
 
 
@@ -623,22 +654,18 @@ def _find_rendition(ch, rname: str) -> Optional[dict]:
 
 
 async def _render_rendition(channel_id: str, rname: str):
-    """Serve an audio/subtitle rendition, aligned with the video — including its
-    discontinuities.
+    """Serve an audio/subtitle rendition perfectly aligned with the video.
 
-    Each rendition advances its OWN frozen timeline whenever it is requested,
-    applying the same buffer hold-back as the video variants, so it never freezes
-    when the player is on a different ABR level (the old bug that stuck subtitles
-    at a fixed MEDIA-SEQUENCE). Segments are always the origin's own (never
-    transcoded).
+    The rendition is rendered THROUGH the video's own frozen timeline (whichever
+    variant is most advanced — i.e. the one the player is polling), substituting
+    the rendition's own origin segment URLs by sequence number. So its
+    MEDIA-SEQUENCE, every #EXT-X-DISCONTINUITY position and the
+    EXT-X-DISCONTINUITY-SEQUENCE are, by construction, identical to the video's —
+    there is no independent decision that could drift by a segment. Rendition
+    segments are never transcoded; only the matching discontinuity tags are added.
 
-    To stay HLS-compliant across variants, a rendition segment is still marked as
-    an 'overlay' beat (keeping its ORIGIN url) at exactly the sequence numbers the
-    video overlaid — so the timeline emits the same #EXT-X-DISCONTINUITY at the
-    same segment boundaries and advances EXT-X-DISCONTINUITY-SEQUENCE identically.
-    We key this on sequence number (exact) and never freeze ahead of the video, so
-    the rendition can't place a discontinuity the video doesn't have (or vice
-    versa)."""
+    Before any video variant has been polled we fall back to the rendition's own
+    buffer-held timeline (plain passthrough) so it still plays."""
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
@@ -653,30 +680,54 @@ async def _render_rendition(channel_id: str, rname: str):
     sub_pl = manifest.parse_media(text, rend["origin_uri"])  # absolute seg URIs
     _ensure_pdt(f"{channel_id}#r{idx}", sub_pl)  # namespaced so it can't clash with video
 
-    tl = _rendition_timeline(channel_id, idx)
-    overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
+    # Remember every rendition seq we see (url, tags, its OWN pdt + duration) so we
+    # can supply them for any seq in the mirrored video window, even after the
+    # origin rendition scrolls it off.
+    mem = _rendition_segs.setdefault((channel_id, idx), {})
+    template = sub_pl.segments[0].uri if sub_pl.segments else None
+    for s in sub_pl.segments:
+        mem[s.seq] = (s.uri, s.tags, s.pdt, s.duration)
 
-    def decide(seg):
-        # Follow the video's single authoritative decision for this seq, so the
-        # discontinuity lands on exactly the same segment as the video (keyed on
-        # sequence number, not PDT). The rendition segment is always the origin's
-        # own — an 'overlay' beat here just carries the matching discontinuity.
-        committed, ov_id = store.peek_seq_decision(channel_id, seg.seq)
-        if committed:
-            return ("overlay", seg.uri, None) if ov_id else ("origin", seg.uri, None)
-        # The video hasn't committed this seq yet. If it's not inside any overlay
-        # window it's plainly origin — freeze now without waiting. Otherwise wait
-        # so we never freeze a discontinuity decision ahead of the video
-        # (advance() falls back to origin after its max_wait if the video never
-        # decides here, e.g. video not being played).
-        if _overlay_covering(overlays, seg) is None:
-            return ("origin", seg.uri, None)
-        return None
+    vid_tl = _most_advanced_video_timeline(channel_id)
+    if vid_tl is None:
+        # No video frozen yet — serve the rendition buffer-held on its own timeline.
+        tl = _rendition_timeline(channel_id, idx)
+        tl.advance(sub_pl.segments, _effective_buffer(ch),
+                   lambda seg: ("origin", seg.uri, None), len(sub_pl.segments) or 1)
+        out = tl.render(sub_pl.discontinuity_sequence, sub_pl.target_duration,
+                        version=sub_pl.version, header_extra=sub_pl.header_extra)
+        for s in [s for s in mem if s < out.media_sequence - 200]:
+            mem.pop(s, None)
+        return PlainTextResponse(manifest.render_media(out),
+                                 media_type="application/vnd.apple.mpegurl")
 
-    window_size = len(sub_pl.segments) or 1
-    tl.advance(sub_pl.segments, _effective_buffer(ch), decide, window_size)
-    out = tl.render(sub_pl.discontinuity_sequence, sub_pl.target_duration,
-                    version=sub_pl.version, header_extra=sub_pl.header_extra)
+    def uri_for(seq: int) -> Optional[str]:
+        e = mem.get(seq)
+        if e:
+            return e[0]
+        return _reconstruct_seg_url(template, seq) if template else None
+
+    def tags_for(seq: int):
+        e = mem.get(seq)
+        return e[1] if e else []
+
+    def pdt_for(seq: int):
+        e = mem.get(seq)
+        return e[2] if e else None
+
+    def dur_for(seq: int):
+        e = mem.get(seq)
+        return e[3] if e else None
+
+    # Render the VIDEO's frozen structure with this rendition's own URLs, PDTs and
+    # durations — identical MSN, discontinuity positions and disc-sequence, by
+    # construction, while keeping the rendition's own timing.
+    out = vid_tl.render(sub_pl.discontinuity_sequence, sub_pl.target_duration,
+                        version=sub_pl.version, header_extra=sub_pl.header_extra,
+                        uri_for=uri_for, tags_for=tags_for,
+                        pdt_for=pdt_for, dur_for=dur_for)
+    for s in [s for s in mem if s < out.media_sequence - 200]:
+        mem.pop(s, None)
     return PlainTextResponse(manifest.render_media(out),
                              media_type="application/vnd.apple.mpegurl")
 

@@ -110,12 +110,15 @@ class VariantTimeline:
 
     def render(self, origin_base_disc_seq: int, target_duration: int,
                version: int = 3, header_extra: Optional[list] = None,
-               uri_for=None, tags_for=None) -> MediaPlaylist:
-        """Render the frozen window. ``uri_for(seq)`` / ``tags_for(seq)`` let an
-        alternate rendition (audio/subtitle) reuse this timeline's exact
-        structure — same MEDIA-SEQUENCE, DISCONTINUITY-SEQUENCE, discontinuity
-        positions, PDT and durations — while substituting its own segment URLs
-        (and tags), so video and its renditions stay perfectly aligned."""
+               uri_for=None, tags_for=None, pdt_for=None, dur_for=None) -> MediaPlaylist:
+        """Render the frozen window. ``uri_for(seq)`` / ``tags_for(seq)`` /
+        ``pdt_for(seq)`` / ``dur_for(seq)`` let an alternate rendition
+        (audio/subtitle) reuse this timeline's exact structure — same
+        MEDIA-SEQUENCE, DISCONTINUITY-SEQUENCE and discontinuity positions — while
+        substituting its OWN segment URLs, tags, PROGRAM-DATE-TIME and durations,
+        so video and its renditions stay perfectly aligned on discontinuities yet
+        each keeps its own timing. Any hook returning None falls back to this
+        timeline's own value for that segment."""
         pl = MediaPlaylist(version=version, target_duration=target_duration)
         pl.header_extra = header_extra or []
         seqs = sorted(self.frozen)
@@ -134,8 +137,10 @@ class VariantTimeline:
                 # decision's own tags but skip only if we truly have nothing.
                 uri = d.uri
             tags = (tags_for(sq) if tags_for else d.tags) or []
-            seg = MediaSegment(uri=uri, duration=d.duration, seq=d.seq,
-                               pdt=d.pdt, tags=list(tags))
+            pdt = (pdt_for(sq) if pdt_for else None) or d.pdt
+            dur = (dur_for(sq) if dur_for else None) or d.duration
+            seg = MediaSegment(uri=uri, duration=dur, seq=d.seq,
+                               pdt=pdt, tags=list(tags))
             seg.discontinuity_before = (i > 0) and (d.disc_native or d.disc_injected)
             pl.segments.append(seg)
         return pl
