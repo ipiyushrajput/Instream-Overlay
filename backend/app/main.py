@@ -622,17 +622,35 @@ def _find_rendition(ch, rname: str) -> Optional[dict]:
     return None
 
 
+def _video_decided_upto(channel_id: str) -> int:
+    """Highest segment sequence any video variant of this channel has already
+    frozen a decision for. Used to keep a rendition from freezing a segment
+    *ahead* of the video, so its discontinuities can never contradict the
+    video's. -1 when no video variant has been polled yet."""
+    m = -1
+    for (cid, _vi), tl in _timelines.items():
+        if cid == channel_id and tl.max_frozen_seq > m:
+            m = tl.max_frozen_seq
+    return m
+
+
 async def _render_rendition(channel_id: str, rname: str):
-    """Serve an audio/subtitle rendition, buffer-aligned with the video.
+    """Serve an audio/subtitle rendition, aligned with the video — including its
+    discontinuities.
 
     Each rendition advances its OWN frozen timeline whenever it is requested,
-    applying the same buffer hold-back as the video variants. Because the origin
-    already aligns the rendition and video segments (same PROGRAM-DATE-TIME and
-    sequence numbers), the two held-back windows line up by wall-clock time — but
-    crucially the rendition no longer depends on any single video variant's
-    timeline being polled, so it can't freeze when the player is on a different
-    ABR level (which previously stuck the subtitle at a fixed MEDIA-SEQUENCE).
-    Renditions are never transcoded, so every segment decision is 'origin'."""
+    applying the same buffer hold-back as the video variants, so it never freezes
+    when the player is on a different ABR level (the old bug that stuck subtitles
+    at a fixed MEDIA-SEQUENCE). Segments are always the origin's own (never
+    transcoded).
+
+    To stay HLS-compliant across variants, a rendition segment is still marked as
+    an 'overlay' beat (keeping its ORIGIN url) at exactly the sequence numbers the
+    video overlaid — so the timeline emits the same #EXT-X-DISCONTINUITY at the
+    same segment boundaries and advances EXT-X-DISCONTINUITY-SEQUENCE identically.
+    We key this on sequence number (exact) and never freeze ahead of the video, so
+    the rendition can't place a discontinuity the video doesn't have (or vice
+    versa)."""
     ch = store.get_channel(channel_id)
     if not ch:
         raise HTTPException(404, "channel not found")
@@ -648,9 +666,27 @@ async def _render_rendition(channel_id: str, rname: str):
     _ensure_pdt(f"{channel_id}#r{idx}", sub_pl)  # namespaced so it can't clash with video
 
     tl = _rendition_timeline(channel_id, idx)
+    overlays = [o for o in store.overlays_for_channel(channel_id) if o.enabled]
+    injected_seqs = store.injected_seqs_for_channel(channel_id)
+    video_upto = _video_decided_upto(channel_id)
 
     def decide(seg):
-        return ("origin", seg.uri, None)  # renditions pass through, never overlaid
+        # Mirror the video's discontinuity exactly, by sequence number: emit an
+        # 'overlay' beat (origin url, no transcode) wherever the video overlaid.
+        if seg.seq in injected_seqs:
+            return ("overlay", seg.uri, None)
+        # Not overlaid. If this seq isn't inside any overlay window, it's plainly
+        # origin — freeze it now without waiting on the video.
+        if _overlay_covering(overlays, seg) is None:
+            return ("origin", seg.uri, None)
+        # Covered by an overlay window but not (yet) injected. If the video has
+        # already decided this seq, it chose to skip the overlay here -> origin.
+        if seg.seq <= video_upto:
+            return ("origin", seg.uri, None)
+        # The video hasn't decided this seq yet: wait so we never freeze a
+        # discontinuity decision ahead of it (advance() falls back to origin after
+        # its max_wait if the video never overlays here, e.g. video not playing).
+        return None
 
     window_size = len(sub_pl.segments) or 1
     tl.advance(sub_pl.segments, _effective_buffer(ch), decide, window_size)

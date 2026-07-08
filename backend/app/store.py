@@ -140,6 +140,19 @@ class Store:
     def injected_count(self, overlay_id: str) -> int:
         return len(self._injected.get(overlay_id, ()))
 
+    def injected_seqs_for_channel(self, channel_id: str) -> set:
+        """Union of every segment sequence the video actually overlaid for this
+        channel. Used so audio/subtitle renditions can place an
+        #EXT-X-DISCONTINUITY at exactly the same sequence numbers as the video
+        (they carry no transcoded segment, just the matching discontinuity)."""
+        out: set = set()
+        with self._lock:
+            for oid, seqs in self._injected.items():
+                ov = self._overlays.get(oid)
+                if ov is not None and ov.channel_id == channel_id:
+                    out |= seqs
+        return out
+
 
 def new_id() -> str:
     return uuid.uuid4().hex[:24]
