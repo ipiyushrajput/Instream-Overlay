@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api.js";
+import { PageBody, PageHeader } from "../PageHeader.jsx";
 
 export default function ChannelList() {
   const [channels, setChannels] = useState([]);
@@ -10,7 +11,9 @@ export default function ChannelList() {
 
   return (
     <div>
-      <h2 className="page-title">Channels</h2>
+      <PageHeader title="Channels"
+                  subtitle="Every mirrored channel, its origin and whether it is on air." />
+      <PageBody>
       <div className="card">
         <div className="card-head"><h3>Your channels</h3>
           <button className="ghost small" onClick={refresh}>Refresh</button></div>
@@ -31,6 +34,7 @@ export default function ChannelList() {
           ))}
         </ul>
       </div>
+      </PageBody>
     </div>
   );
 }

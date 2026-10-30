@@ -1,8 +1,11 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api.js";
+import { PageBody, PageHeader } from "../PageHeader.jsx";
 
-const TYPE_COLOR = { lband: "#2dd4a7", top_band: "#7c3aed", bottom_band: "#059669", pip: "#e5484d" };
+/* Overlay types take their colour from the system spectrum: blue orients,
+   violet is secondary emphasis, pink marks intervention. */
+const TYPE_COLOR = { lband: "#1428A0", top_band: "#7B2CBF", bottom_band: "#12864C", pip: "#FF2D55" };
 
 function fmt(iso) { if (!iso) return "—"; try { return new Date(iso).toLocaleString(); } catch { return iso; } }
 
@@ -23,11 +26,10 @@ export default function Insights() {
 
   return (
     <div>
-      <div className="page-head">
-        <h2 className="page-title" style={{ margin: 0 }}>Insights</h2>
-        <button className="ghost small" onClick={refresh}>Refresh</button>
-      </div>
-
+      <PageHeader title="Insights"
+                  subtitle="Viewer sessions and overlay delivery, per channel."
+                  actions={<button className="ghost small" onClick={refresh}>Refresh</button>} />
+      <PageBody>
       <div className="kpi-row">
         <div className="kpi"><div className="kpi-k">Channels</div><div className="kpi-v">{rows.length}</div></div>
         <div className="kpi"><div className="kpi-k">Viewer sessions</div><div className="kpi-v">{totals.sessions}</div></div>
@@ -94,6 +96,7 @@ export default function Insights() {
           </div>
         );
       })}
+      </PageBody>
     </div>
   );
 }
