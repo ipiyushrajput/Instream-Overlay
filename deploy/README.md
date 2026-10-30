@@ -171,10 +171,23 @@ Work through these three, in order:
 2. **Is nginx reading the file you edited?** `nginx -t` prints the config path
    it actually loads. On a machine with more than one nginx, it is easy to edit
    a different copy.
-3. **Did the reload take?** `nginx -s reload` is unreliable on Windows. Force a
-   restart, or nginx keeps serving the previous `root`:
+3. **Did the reload take, and is only one nginx running?** `nginx -s reload` is
+   unreliable on Windows, and a stale instance left bound to :80 goes on
+   serving its own `root` while every edit appears to do nothing — proxied
+   locations keep working the whole time, which makes it look like a static
+   problem rather than a stale process.
+
+   A healthy nginx is several processes (one master plus workers), so the count
+   is not the tell; the binary path is. Check who actually owns the port:
    ```powershell
-   nginx -s stop; taskkill /F /IM nginx.exe; start nginx
+   Get-Process nginx | Select-Object Id, Path   # differing paths = two installs
+   Get-Process -Id (Get-NetTCPConnection -LocalPort 80 -State Listen).OwningProcess |
+       Select-Object Id, Path
+   ```
+   Then clear them all out and start one:
+   ```powershell
+   taskkill /F /IM nginx.exe    # every instance, master and workers
+   start nginx
    ```
 
 The error log names the file it tried:
