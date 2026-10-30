@@ -5,6 +5,7 @@ import Player from "../Player.jsx";
 import OverlayControls from "../OverlayControls.jsx";
 import ApiExplorer from "../ApiExplorer.jsx";
 import Timeline from "../Timeline.jsx";
+import { PageBody } from "../PageHeader.jsx";
 
 export default function ChannelConsole() {
   const { id } = useParams();
@@ -97,9 +98,9 @@ export default function ChannelConsole() {
   return (
     <div>
       <div className="console-head">
-        <div>
-          <h2 style={{ margin: 0 }}>{channel.name}</h2>
-          <div className="hint">{channel.master_url}</div>
+        <div style={{ minWidth: 0 }}>
+          <h2 className="page-title">{channel.name}</h2>
+          <div className="ch-url">{channel.master_url}</div>
         </div>
         <div className="head-actions">
           <span className={`live-pill ${liveOn ? "on" : ""}`}>
@@ -111,6 +112,7 @@ export default function ChannelConsole() {
         </div>
       </div>
 
+      <PageBody>
       {/* Dual preview: input origin (left) vs our overlaid output (right) */}
       <div className="dual">
         <div className="card">
@@ -169,6 +171,7 @@ export default function ChannelConsole() {
           <div className="card log"><h3>Activity</h3><pre>{log.join("\n") || "—"}</pre></div>
         </div>
       </div>
+      </PageBody>
     </div>
   );
 }

@@ -5,15 +5,18 @@ import ChannelList from "./pages/ChannelList.jsx";
 import ApiPage from "./pages/ApiPage.jsx";
 import Insights from "./pages/Insights.jsx";
 import ChannelConsole from "./pages/ChannelConsole.jsx";
+import {
+  IconApi, IconChannels, IconCollapse, IconExpand, IconInsights, IconRegister,
+} from "./Icons.jsx";
 
 const SAMSUNG_LOGO =
   "https://images.samsung.com/is/image/samsung/assets/in/tvs/smart-tv/samsung-tv-plus/samsung-tv-plus-icon.jpg";
 
 const NAV = [
-  ["/", "Register channel", "＋", true],
-  ["/channels", "Channels", "☰", false],
-  ["/insights", "Insights", "📊", false],
-  ["/api", "API explorer", "{ }", false],
+  ["/", "Register channel", IconRegister, true],
+  ["/channels", "Channels", IconChannels, false],
+  ["/insights", "Insights", IconInsights, false],
+  ["/api", "API explorer", IconApi, false],
 ];
 
 export default function App() {
@@ -44,11 +47,11 @@ export default function App() {
           </div>
         </div>
 
-        <nav className="side-nav">
-          {NAV.map(([to, label, icon, end]) => (
-            <NavLink key={to} to={to} end={end} title={label}
+        <nav className="side-nav" aria-label="Sections">
+          {NAV.map(([to, label, Icon, end]) => (
+            <NavLink key={to} to={to} end={end} title={collapsed ? label : undefined}
                      className={({ isActive }) => `side-link ${isActive ? "active" : ""}`}>
-              <span className="side-ic">{icon}</span>
+              <span className="side-ic"><Icon size={18} /></span>
               {!collapsed && <span className="side-label">{label}</span>}
             </NavLink>
           ))}
@@ -56,8 +59,11 @@ export default function App() {
 
         <div className="side-bottom">
           <button className="side-toggle" onClick={toggle}
-                  title={collapsed ? "Expand" : "Collapse"} aria-label="Toggle sidebar">
-            <span className="side-ic">{collapsed ? "»" : "«"}</span>
+                  title={collapsed ? "Expand" : "Collapse"}
+                  aria-label={collapsed ? "Expand the navigation rail" : "Collapse the navigation rail"}>
+            <span className="side-ic">
+              {collapsed ? <IconExpand size={18} /> : <IconCollapse size={18} />}
+            </span>
             {!collapsed && <span className="side-label">Collapse</span>}
           </button>
         </div>

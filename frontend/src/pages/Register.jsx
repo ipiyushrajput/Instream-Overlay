@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api.js";
+import { PageBody, PageHeader } from "../PageHeader.jsx";
 
 const DEFAULT_ORIGIN = "http://107.109.131.68:8100/master.m3u8";
 
@@ -22,7 +23,9 @@ export default function Register() {
 
   return (
     <div>
-      <h2 className="page-title">Register a channel</h2>
+      <PageHeader title="Register a channel"
+                  subtitle="Point the console at an HLS origin; its manifests are mirrored and overlays splice in." />
+      <PageBody>
       <div className="card narrow-card">
         <label className="field"><span>Channel name</span>
           <input value={name} onChange={(e) => setName(e.target.value)}
@@ -39,6 +42,7 @@ export default function Register() {
           you stop ingestion.
         </p>
       </div>
+      </PageBody>
     </div>
   );
 }
