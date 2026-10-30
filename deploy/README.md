@@ -32,6 +32,14 @@ npm run build          # -> frontend/dist
 To pre-fill the origin field on the Register page, build with
 `VITE_DEFAULT_ORIGIN=https://your-cdn/master.m3u8`.
 
+> **Do not run `npm run dev` on the server.** That starts the Vite dev server on
+> :5173, which nothing here points at. nginx serves the built files straight
+> from `frontend/dist`, so there is no Node process in production — only the
+> backend, MySQL and nginx. Re-run `npm run build` after a frontend change;
+> nginx picks the new files up on the next request with no reload, because
+> `index.html` is served `no-cache` and asset filenames are content-hashed.
+> `npm run dev` is for your own machine while editing the UI.
+
 ## 3. Configure and run the backend
 
 `PUBLIC_BASE_URL` **must** be the address a viewer's player can reach — the
