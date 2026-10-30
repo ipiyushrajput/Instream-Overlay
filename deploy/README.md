@@ -92,11 +92,47 @@ nginx -s reload                # or: start nginx
 
 ## 5. Open the port
 
-`13.238.93.19` is a cloud instance, so the OS firewall is not the only gate:
-**make sure inbound TCP 80 is allowed** in the instance's security group /
-firewall, or the port is unreachable from outside however correct nginx is.
+There are **two** gates on a cloud instance, and both must allow TCP 80:
 
-On Linux, binding port 80 needs root (`sudo nginx`) or
+1. **The cloud security group / firewall** — for `13.238.93.19` that is the
+   EC2 instance's security group. Add an inbound rule: TCP, port 80, from
+   `0.0.0.0/0` (or just your office range). Nothing below helps until this is
+   open.
+2. **The OS firewall**, below.
+
+**Windows (PowerShell, as Administrator)**
+
+```powershell
+New-NetFirewallRule -DisplayName "Instream Overlay HTTP (80)" `
+                    -Direction Inbound -Protocol TCP -LocalPort 80 `
+                    -Action Allow -Profile Any
+```
+
+Check it, and check nginx is actually listening:
+
+```powershell
+Get-NetFirewallRule -DisplayName "Instream Overlay HTTP (80)"
+Get-NetTCPConnection -LocalPort 80 -State Listen
+```
+
+If something else already holds port 80 (IIS is the usual culprit on Windows
+Server), nginx will fail to bind. Find and stop it:
+
+```powershell
+Get-Process -Id (Get-NetTCPConnection -LocalPort 80 -State Listen).OwningProcess
+Stop-Service W3SVC; Set-Service W3SVC -StartupType Disabled   # if it is IIS
+```
+
+To remove the rule later: `Remove-NetFirewallRule -DisplayName "Instream Overlay HTTP (80)"`.
+
+**Linux**
+
+```bash
+sudo ufw allow 80/tcp                      # Ubuntu/Debian
+sudo firewall-cmd --permanent --add-service=http && sudo firewall-cmd --reload  # RHEL
+```
+
+Binding port 80 on Linux also needs root (`sudo nginx`) or
 `setcap 'cap_net_bind_service=+ep'` on the binary.
 
 ## 6. Verify
