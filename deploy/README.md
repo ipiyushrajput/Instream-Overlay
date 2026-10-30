@@ -1,6 +1,6 @@
 # Deploying the Instream Overlay console
 
-CloudFront fronts one nginx origin on **port 80** that serves the built frontend and proxies the
+One nginx origin on **port 80** serves the built frontend and proxies the
 backend, so the browser bundle carries no host or port and the same artefact
 runs on Windows or Linux unchanged.
 
@@ -11,8 +11,7 @@ browser ──► nginx :80   ──┬──► frontend/dist           (static
                                                         /uploads /ws)
 ```
 
-Public entry point: `https://d2nq8vzsrk6j8k.cloudfront.net/` (CloudFront ->
-`13.238.93.19:80`). The app owns the whole origin, so URLs carry no port.
+The app owns the whole origin, so URLs carry no port: `http://13.238.93.19/`.
 
 ## 1. Prerequisites
 
@@ -55,7 +54,7 @@ master playlist loads while every child 404s.
 
 | Variable | Value here | Purpose |
 |---|---|---|
-| `PUBLIC_BASE_URL` | `https://d2nq8vzsrk6j8k.cloudfront.net` | written into manifests |
+| `PUBLIC_BASE_URL` | `http://13.238.93.19` | written into manifests |
 | `DB_HOST` / `DB_PORT` | `localhost` / `3306` | MySQL |
 | `DB_USER` / `DB_PASS` / `DB_NAME` | … / … / `instream_overlay` | MySQL |
 | `OVERLAY_BUFFER_SEGMENTS` | `6` | output held behind live |
@@ -68,7 +67,7 @@ master playlist loads while every child 404s.
 cd backend
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-export PUBLIC_BASE_URL=https://d2nq8vzsrk6j8k.cloudfront.net
+export PUBLIC_BASE_URL=http://13.238.93.19
 export OVERLAY_HWACCEL=none          # no Quick Sync on most cloud VMs
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -79,7 +78,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 cd backend
 python -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-$env:PUBLIC_BASE_URL = "https://d2nq8vzsrk6j8k.cloudfront.net"
+$env:PUBLIC_BASE_URL = "http://13.238.93.19"
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -101,14 +100,9 @@ nginx -s reload                # or: start nginx
 There are **two** gates on a cloud instance, and both must allow TCP 80:
 
 1. **The cloud security group / firewall** — for `13.238.93.19` that is the
-   EC2 instance's security group. Add an inbound rule: TCP, port 80. Nothing
-   below helps until this is open.
-
-   Once CloudFront is in front, prefer restricting that rule to CloudFront
-   instead of `0.0.0.0/0`: pick the AWS-managed prefix list
-   **`com.amazonaws.global.cloudfront.origin-facing`** as the source. Left open
-   to the world, anyone who learns the IP can bypass CloudFront and reach the
-   console over plain HTTP, with no TLS and none of the cache rules.
+   EC2 instance's security group. Add an inbound rule: TCP, port 80, from
+   `0.0.0.0/0` (or just your office range). Nothing below helps until this is
+   open.
 2. **The OS firewall**, below.
 
 **Windows (PowerShell, as Administrator)**
@@ -146,79 +140,15 @@ sudo firewall-cmd --permanent --add-service=http && sudo firewall-cmd --reload  
 Binding port 80 on Linux also needs root (`sudo nginx`) or
 `setcap 'cap_net_bind_service=+ep'` on the binary.
 
-## 6. CloudFront
-
-The public entry point is `https://d2nq8vzsrk6j8k.cloudfront.net/`:
-
-```
-viewer ──HTTPS──► CloudFront ──HTTP──► nginx :80 (13.238.93.19) ──► backend :8000
-```
-
-**Origin settings**
-
-| Setting | Value |
-|---|---|
-| Origin domain | `13.238.93.19` |
-| Protocol | **HTTP only** (the origin has no TLS; CloudFront terminates it) |
-| HTTP port | 80 |
-| Viewer protocol policy | Redirect HTTP to HTTPS |
-
-**Behaviours.** Order matters — CloudFront evaluates path patterns top down and
-the first match wins, so the specific patterns must sit above `Default (*)`.
-
-| # | Path pattern | Cache policy | Methods | Why |
-|---|---|---|---|---|
-| 1 | `/api/*` | **CachingDisabled** | **GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE** | dynamic, and the console writes |
-| 2 | `/ws` | **CachingDisabled** | GET, HEAD, OPTIONS | status websocket |
-| 3 | `/hls/*` | **CachingDisabled** | GET, HEAD | live manifest |
-| 4 | `/manifest/*` | **CachingDisabled** | GET, HEAD | live manifest |
-| 5 | `/rendition/*` | **CachingDisabled** | GET, HEAD | live manifest |
-| 6 | `/segment/*` | CachingOptimized | GET, HEAD | immutable, cache it |
-| 7 | `/uploads/*` | CachingOptimized | GET, HEAD | immutable, cache it |
-| 8 | `/assets/*` | CachingOptimized | GET, HEAD | hashed bundle |
-| 9 | `Default (*)` | **CachingDisabled** | GET, HEAD | `index.html` must never be stale |
-
-For 1 and 2 also attach the **AllViewer** origin request policy, so query
-strings, headers and the websocket `Upgrade`/`Connection` handshake reach the
-origin intact.
-
-### The two that silently break things
-
-- **Caching a live manifest.** A `.m3u8` is rewritten every segment. If
-  CloudFront caches it, every viewer is served a stale window and playback
-  stalls or never advances — with nothing wrong in the logs. nginx already
-  sends `no-store` on those paths, but set **CachingDisabled** on behaviours
-  3–5 rather than relying on the origin header being honoured.
-- **Default methods are GET/HEAD only.** Registering a channel, scheduling an
-  overlay and deleting one are `POST`/`DELETE`. On a GET-only behaviour
-  CloudFront rejects them with **403 before they ever reach the origin**, so
-  the console loads and reads fine but no write works.
-
-### Mixed content
-
-The page is HTTPS, so every URL inside it must be too. `PUBLIC_BASE_URL` must
-be the **CloudFront** address:
-
-```
-PUBLIC_BASE_URL=https://d2nq8vzsrk6j8k.cloudfront.net
-```
-
-Left as the IP, the master playlist still loads but every child manifest and
-segment is an `http://13.238.93.19/...` URL inside an HTTPS page — which the
-browser blocks as mixed content, and the player simply fails.
-
-The source stream you ingest must be HTTPS too, for the same reason: its
-segments are passed through into our manifests untouched.
-
-## 7. Verify
+## 6. Verify
 
 ```bash
-curl https://d2nq8vzsrk6j8k.cloudfront.net/api/health   # {"ok":true,...}
-curl -I https://d2nq8vzsrk6j8k.cloudfront.net/         # 200, text/html
+curl http://13.238.93.19/api/health            # {"ok":true,...}
+curl -I http://13.238.93.19/                   # 200, text/html
 ```
 
-Then open `https://d2nq8vzsrk6j8k.cloudfront.net/`, register a channel, and
-check the output master URL on the console reads **`https://d2nq8vzsrk6j8k.cloudfront.net/...`**
+Then open `http://13.238.93.19/`, register a channel, and check that the
+output master URL on the console page is an **`http://13.238.93.19/...`**
 address. If it shows anything else, `PUBLIC_BASE_URL` is wrong.
 
 ## Troubleshooting
