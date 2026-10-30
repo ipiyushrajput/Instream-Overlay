@@ -1,18 +1,17 @@
 # Deploying the Instream Overlay console
 
-One nginx origin on **port 8080** serves the built frontend and proxies the
+One nginx origin on **port 80** serves the built frontend and proxies the
 backend, so the browser bundle carries no host or port and the same artefact
 runs on Windows or Linux unchanged.
 
 ```
-browser ──► nginx :8080 ──┬──► frontend/dist           (static, SPA fallback)
+browser ──► nginx :80   ──┬──► frontend/dist           (static, SPA fallback)
                           └──► FastAPI 127.0.0.1:8000  (/api /hls /manifest
                                                         /rendition /segment
                                                         /uploads /ws)
 ```
 
-Port 8080 is used because port 80 on this server already hosts other services
-whose routes (`/api/`, `/channel/`, `/ws/`) would collide.
+The app owns the whole origin, so URLs carry no port: `http://13.238.93.19/`.
 
 ## 1. Prerequisites
 
@@ -42,7 +41,7 @@ master playlist loads while every child 404s.
 
 | Variable | Value here | Purpose |
 |---|---|---|
-| `PUBLIC_BASE_URL` | `http://13.238.93.19:8080` | written into manifests |
+| `PUBLIC_BASE_URL` | `http://13.238.93.19` | written into manifests |
 | `DB_HOST` / `DB_PORT` | `localhost` / `3306` | MySQL |
 | `DB_USER` / `DB_PASS` / `DB_NAME` | … / … / `instream_overlay` | MySQL |
 | `OVERLAY_BUFFER_SEGMENTS` | `6` | output held behind live |
@@ -55,7 +54,7 @@ master playlist loads while every child 404s.
 cd backend
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-export PUBLIC_BASE_URL=http://13.238.93.19:8080
+export PUBLIC_BASE_URL=http://13.238.93.19
 export OVERLAY_HWACCEL=none          # no Quick Sync on most cloud VMs
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
@@ -66,7 +65,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 cd backend
 python -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-$env:PUBLIC_BASE_URL = "http://13.238.93.19:8080"
+$env:PUBLIC_BASE_URL = "http://13.238.93.19"
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -75,8 +74,8 @@ Bind the backend to `127.0.0.1`, not `0.0.0.0` — only nginx should reach it.
 ## 4. nginx
 
 Copy `deploy/nginx.conf` over your `nginx.conf` and change **one line** — the
-`root` of the 8080 server — to point at `frontend/dist` on this machine. Forward
-slashes work on Windows too.
+`root` — to point at `frontend/dist` on this machine. Forward slashes work on
+Windows too.
 
 ```bash
 nginx -t                       # check the config
@@ -86,18 +85,21 @@ nginx -s reload                # or: start nginx
 ## 5. Open the port
 
 `13.238.93.19` is a cloud instance, so the OS firewall is not the only gate:
-**add an inbound rule for TCP 8080** in the instance's security group /
+**make sure inbound TCP 80 is allowed** in the instance's security group /
 firewall, or the port is unreachable from outside however correct nginx is.
+
+On Linux, binding port 80 needs root (`sudo nginx`) or
+`setcap 'cap_net_bind_service=+ep'` on the binary.
 
 ## 6. Verify
 
 ```bash
-curl http://13.238.93.19:8080/api/health            # {"ok":true,...}
-curl -I http://13.238.93.19:8080/                   # 200, text/html
+curl http://13.238.93.19/api/health            # {"ok":true,...}
+curl -I http://13.238.93.19/                   # 200, text/html
 ```
 
-Then open `http://13.238.93.19:8080/`, register a channel, and check that the
-output master URL on the console page is an **`http://13.238.93.19:8080/...`**
+Then open `http://13.238.93.19/`, register a channel, and check that the
+output master URL on the console page is an **`http://13.238.93.19/...`**
 address. If it shows anything else, `PUBLIC_BASE_URL` is wrong.
 
 ## Notes

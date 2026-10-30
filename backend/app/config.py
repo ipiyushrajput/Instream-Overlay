@@ -36,7 +36,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 # the master playlist loads and every child 404s. Behind nginx on this server
 # that is the proxy's host and port; override per environment with the env var.
 PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL", "http://13.238.93.19:8080").rstrip("/")
+    "PUBLIC_BASE_URL", "http://13.238.93.19").rstrip("/")
 
 # How far behind the live edge we hold our manifest, in segments. This is the
 # processing headroom that lets the worker transcode overlay segments before a
