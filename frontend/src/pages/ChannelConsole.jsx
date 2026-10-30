@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { api, API_BASE } from "../api.js";
+import { api, wsUrl } from "../api.js";
 import Player from "../Player.jsx";
 import OverlayControls from "../OverlayControls.jsx";
 import ApiExplorer from "../ApiExplorer.jsx";
@@ -63,7 +63,7 @@ export default function ChannelConsole() {
   }, [id]);
 
   useEffect(() => {
-    const ws = new WebSocket(API_BASE.replace(/^http/, "ws") + "/ws");
+    const ws = new WebSocket(wsUrl("/ws"));
     wsRef.current = ws;
     ws.onmessage = (ev) => {
       try {

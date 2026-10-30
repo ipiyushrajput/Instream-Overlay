@@ -3,7 +3,9 @@ import { useNavigate } from "react-router-dom";
 import { api } from "../api.js";
 import { PageBody, PageHeader } from "../PageHeader.jsx";
 
-const DEFAULT_ORIGIN = "http://107.109.131.68:8100/master.m3u8";
+/* Prefill for the origin field. Empty by default so the build is tied to no
+   machine; set VITE_DEFAULT_ORIGIN at build time to pre-populate it. */
+const DEFAULT_ORIGIN = import.meta.env.VITE_DEFAULT_ORIGIN || "";
 
 export default function Register() {
   const [name, setName] = useState("");

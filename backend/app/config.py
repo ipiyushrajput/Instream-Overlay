@@ -29,7 +29,14 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 
 # Public base URL of THIS backend, used when rewriting manifests so players and
 # hls.js fetch our child manifests / overlaid segments from the right host.
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://107.109.131.68:8000").rstrip("/")
+#
+# This MUST be the address a viewer's player can reach — i.e. the public address
+# of the reverse proxy, not the loopback the app binds to. Every variant,
+# rendition, segment and upload URL we emit is built from it, so if it is wrong
+# the master playlist loads and every child 404s. Behind nginx on this server
+# that is the proxy's host and port; override per environment with the env var.
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "http://13.238.93.19:8080").rstrip("/")
 
 # How far behind the live edge we hold our manifest, in segments. This is the
 # processing headroom that lets the worker transcode overlay segments before a

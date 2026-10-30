@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { api, API_BASE } from "./api.js";
+import { api, sameOrigin } from "./api.js";
 
 const TYPES = [
   ["lband", "L-band", { left: 0, top: 0, width: "24%", height: "100%" }],
@@ -46,7 +46,7 @@ export default function OverlayControls({ channelId, minLead, onChange, onLog })
     } catch (e) { setErr(String(e)); } finally { setBusy(false); }
   }
 
-  const imgSrc = image ? `${API_BASE}${new URL(image.url, API_BASE).pathname}` : null;
+  const imgSrc = image ? sameOrigin(image.url) : null;
 
   return (
     <div className="card">
@@ -67,7 +67,7 @@ export default function OverlayControls({ channelId, minLead, onChange, onLog })
           <button key={d.image_filename}
                   className={`preset ${image?.image_filename === d.image_filename ? "active" : ""}`}
                   onClick={() => pickDefault(d)} title={d.label}>
-            <img src={`${API_BASE}${new URL(d.url, API_BASE).pathname}`} alt={d.label} />
+            <img src={sameOrigin(d.url)} alt={d.label} />
             <span>{d.label}</span>
           </button>
         ))}

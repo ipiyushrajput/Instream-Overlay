@@ -1,6 +1,48 @@
-// Backend base URL. Override at build/run time with VITE_API_BASE.
-export const API_BASE =
-  import.meta.env.VITE_API_BASE || "http://107.109.131.68:8000";
+/**
+ * Backend base URL.
+ *
+ * Empty means "same origin", which is what you want behind a reverse proxy: nginx
+ * serves this bundle and proxies the API on one host, so the build carries no
+ * machine, IP or port and the same artefact runs anywhere (Windows or Linux).
+ *
+ * Set VITE_API_BASE at build time only when the API lives somewhere else. A dev
+ * run (`npm run dev`) defaults to the backend on :8000 because Vite serves the
+ * page from :5173, which is a different origin.
+ */
+const RAW_BASE = import.meta.env.VITE_API_BASE;
+export const API_BASE = (
+  RAW_BASE === undefined || RAW_BASE === null
+    ? (import.meta.env.DEV ? "http://127.0.0.1:8000" : "")
+    : RAW_BASE
+).replace(/\/+$/, "");
+
+/** Absolute http(s) URL for a backend path — safe to copy, paste or hand to a player. */
+export function absUrl(path) {
+  if (API_BASE) return `${API_BASE}${path}`;
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  return `${origin}${path}`;
+}
+
+/** ws:// or wss:// URL for a backend path, derived from the page when same-origin. */
+export function wsUrl(path) {
+  if (API_BASE) return API_BASE.replace(/^http/, "ws") + path;
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}${path}`;
+}
+
+/**
+ * Re-point a URL the backend built from PUBLIC_BASE_URL at the origin the browser
+ * actually uses, so an asset still loads when the two differ (behind a proxy, or
+ * when PUBLIC_BASE_URL names an address only the server can reach).
+ */
+export function sameOrigin(url) {
+  try {
+    const u = new URL(url, typeof window === "undefined" ? undefined : window.location.origin);
+    return absUrl(`${u.pathname}${u.search}`);
+  } catch {
+    return url;
+  }
+}
 
 async function req(method, path, body) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -45,6 +87,6 @@ export const api = {
   },
 
   health: () => req("GET", "/api/health"),
-  masterUrl: (id) => `${API_BASE}/hls/${id}/master.m3u8`,
+  masterUrl: (id) => absUrl(`/hls/${id}/master.m3u8`),
   raw: req,
 };
