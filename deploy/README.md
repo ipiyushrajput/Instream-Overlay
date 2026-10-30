@@ -102,6 +102,42 @@ Then open `http://13.238.93.19/`, register a channel, and check that the
 output master URL on the console page is an **`http://13.238.93.19/...`**
 address. If it shows anything else, `PUBLIC_BASE_URL` is wrong.
 
+## Troubleshooting
+
+**`/` returns 500 but `/api/health` works.**
+The proxy is fine; nginx cannot find the frontend. `root` is pointing at a path
+that does not exist, the frontend has not been built, or the nginx worker
+cannot read the directory. Confirm with the error log — it will name the file:
+
+```bash
+# Linux
+tail -n 50 /var/log/nginx/error.log
+# Windows
+type logs\error.log
+```
+
+Then check the build actually exists at the path in `root`:
+
+```bash
+# Linux
+ls -l /opt/instream-overlay/frontend/dist/index.html
+# Windows
+dir C:\Piyush\POC\Instream-Overlay\frontend\dist\index.html
+```
+
+If it is missing, build it (`cd frontend && npm ci && npm run build`). If it is
+there but nginx still cannot read it on Linux, the worker user needs traverse
+permission on every parent directory — serving out of `/home/<user>/` is the
+usual culprit. Put the build somewhere like `/opt/instream-overlay`, or:
+
+```bash
+sudo chmod o+x /home /home/<user>            # traverse
+sudo chown -R root:www-data /opt/instream-overlay/frontend/dist
+```
+
+**Everything 404s after a correct build.** Check `root` has no trailing slash
+and points at `dist` itself, not its parent.
+
 ## Notes
 
 - **CORS**: the backend sends its own `Access-Control-Allow-Origin`. Do not add
