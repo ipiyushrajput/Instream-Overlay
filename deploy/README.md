@@ -32,6 +32,11 @@ npm run build          # -> frontend/dist
 To pre-fill the origin field on the Register page, build with
 `VITE_DEFAULT_ORIGIN=https://your-cdn/master.m3u8`.
 
+`npm ci` reports audit "vulnerabilities" from transitive dev dependencies. They
+do not affect the build or anything that runs in production. **Do not run
+`npm audit fix --force`** to clear them — it will upgrade Vite across a major
+version and break the build.
+
 > **Do not run `npm run dev` on the server.** That starts the Vite dev server on
 > :5173, which nothing here points at. nginx serves the built files straight
 > from `frontend/dist`, so there is no Node process in production — only the
@@ -149,9 +154,30 @@ address. If it shows anything else, `PUBLIC_BASE_URL` is wrong.
 ## Troubleshooting
 
 **`/` returns 500 but `/api/health` works.**
-The proxy is fine; nginx cannot find the frontend. `root` is pointing at a path
-that does not exist, the frontend has not been built, or the nginx worker
-cannot read the directory. Confirm with the error log — it will name the file:
+The proxy is fine; nginx cannot find the frontend — proxied locations never
+touch `root`, which is why only the static side fails. In the log it reads:
+
+```
+rewrite or internal redirection cycle while internally redirecting to "/index.html"
+```
+
+Work through these three, in order:
+
+1. **Is there a build?** `npm ci` installs dependencies but produces no `dist`;
+   `npm run build` is a separate step.
+   ```powershell
+   Test-Path C:\path\to\frontend\dist\index.html
+   ```
+2. **Is nginx reading the file you edited?** `nginx -t` prints the config path
+   it actually loads. On a machine with more than one nginx, it is easy to edit
+   a different copy.
+3. **Did the reload take?** `nginx -s reload` is unreliable on Windows. Force a
+   restart, or nginx keeps serving the previous `root`:
+   ```powershell
+   nginx -s stop; taskkill /F /IM nginx.exe; start nginx
+   ```
+
+The error log names the file it tried:
 
 ```bash
 # Linux
