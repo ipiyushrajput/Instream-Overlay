@@ -13,7 +13,7 @@ import logging
 from typing import Optional
 
 from sqlalchemy import (Column, DateTime, Integer, MetaData, String, Table, Text,
-                        create_engine, delete, func, insert, select, update)
+                        create_engine, delete, func, insert, select, text, update)
 from sqlalchemy.engine import Engine
 
 from . import config
@@ -92,6 +92,21 @@ def init() -> bool:
 
 def available() -> bool:
     return _engine is not None
+
+
+def ping() -> tuple[bool, str]:
+    """Round-trip a trivial query. ``available()`` only says an engine was
+    built at startup; this says the database is answering now, which is what a
+    health check has to report — a DB that died after startup still has an
+    engine."""
+    if _engine is None:
+        return (False, "disabled" if not config.DB_ENABLED else "not initialised")
+    try:
+        with _engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return (True, "ok")
+    except Exception as exc:  # noqa: BLE001
+        return (False, str(exc)[:200])
 
 
 # --- channels --------------------------------------------------------------

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,9 +15,10 @@ import httpx
 from fastapi import (FastAPI, File, HTTPException, Request, UploadFile, WebSocket,
                      WebSocketDisconnect)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Response
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from . import config, db, defaults, manifest
+from . import config, db, defaults, manifest, retention
 from .codecs import video_params_from_variant
 from .models import (Channel, CreateOverlayRelativeRequest, CreateOverlayRequest,
                      IngestRequest, OverlayEvent, UpdateChannelRequest, VariantInfo)
@@ -218,6 +220,9 @@ log = logging.getLogger("overlay.api")
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     config.setup_logging()
+    # Refuse to start on missing configuration, naming what is absent, rather
+    # than failing later inside a driver with an error that does not say why.
+    config.require_settings()
     log.info("starting up: buffer=%d segs, workers=%d, verify_tls=%s, data=%s",
              config.BUFFER_SEGMENTS, config.MAX_TRANSCODE_WORKERS,
              config.VERIFY_TLS, config.DATA_DIR)
@@ -232,8 +237,12 @@ async def lifespan(app: FastAPI):
     # Background pre-warm: transcode overlays across all variants the moment their
     # segments appear at the origin, well ahead of the held-back output edge.
     app.state.prewarm = asyncio.create_task(_prewarm_loop())
+    # Background sweep: transcoded segments are only needed while inside the
+    # output window, and without this they accumulate until the disk fills.
+    app.state.retention = asyncio.create_task(_retention_loop())
     yield
     app.state.prewarm.cancel()
+    app.state.retention.cancel()
     await pool.stop()
     await app.state.http.aclose()
 
@@ -899,6 +908,35 @@ async def _prewarm_loop() -> None:
         await asyncio.sleep(config.PREWARM_INTERVAL)
 
 
+async def _retention_loop() -> None:
+    """Sweep aged-out transcoded segments and the bookkeeping that tracks them.
+
+    Run in a worker thread: it walks the segment tree, which on a busy channel
+    is thousands of files, and the event loop is also serving live manifests."""
+    while True:
+        try:
+            await asyncio.to_thread(retention.sweep_segments)
+            pool.prune(config.SEGMENT_RETENTION_SECONDS)
+            _prune_origin_cache()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("retention sweep failed: %s", exc)
+        await asyncio.sleep(config.RETENTION_INTERVAL)
+
+
+def _prune_origin_cache() -> None:
+    """Drop cached origin playlists and their locks once they go unused. The
+    lock map in particular is keyed by URL and would otherwise keep an entry per
+    variant of every channel ever ingested."""
+    now = time.monotonic()
+    stale = [u for u, (ts, _) in _origin_cache.items() if now - ts > 600]
+    for url in stale:
+        _origin_cache.pop(url, None)
+    for url in [u for u in _origin_locks if u not in _origin_cache]:
+        lock = _origin_locks.get(url)
+        if lock is not None and not lock.locked():
+            _origin_locks.pop(url, None)
+
+
 @app.get("/manifest/{channel_id}/{session_id}/{variant_index}.m3u8")
 async def serve_child(channel_id: str, session_id: str, variant_index: int):
     ch = store.get_channel(channel_id)
@@ -1022,5 +1060,49 @@ async def debug_channel(channel_id: str, variant_index: int = 0):
 
 
 @app.get("/api/health")
-async def health():
-    return {"ok": True, "channels": len(store.list_channels())}
+async def health(response: Response):
+    """What is actually working, not merely that the process is up.
+
+    Each dependency is reported separately and the ones that stop overlays from
+    being delivered mark the service degraded, so monitoring sees trouble
+    coming — a full disk or a missing ffmpeg is invisible until a transcode
+    fails, by which point viewers have already seen it. Degraded answers 503 so
+    a load balancer or an alert can act on the status code alone."""
+    checks: dict[str, dict] = {}
+
+    db_ok, db_detail = await asyncio.to_thread(db.ping)
+    checks["database"] = {
+        "ok": db_ok or not config.DB_ENABLED,
+        "required": config.DB_ENABLED,
+        "detail": db_detail,
+    }
+
+    for binary, attr in (("ffmpeg", "FFMPEG"), ("ffprobe", "FFPROBE")):
+        found = shutil.which(getattr(config, attr))
+        checks[binary] = {
+            "ok": bool(found),
+            "required": True,
+            "detail": found or f"{getattr(config, attr)} not found on PATH",
+        }
+
+    free_mb = retention.disk_free_mb()
+    checks["disk"] = {
+        "ok": free_mb is None or free_mb >= config.MIN_FREE_DISK_MB,
+        "required": True,
+        "detail": ("unknown" if free_mb is None
+                   else f"{free_mb:.0f} MB free (floor {config.MIN_FREE_DISK_MB} MB)"),
+    }
+
+    degraded = sorted(k for k, c in checks.items() if c["required"] and not c["ok"])
+    if degraded:
+        response.status_code = 503
+        log.warning("health degraded: %s", ", ".join(degraded))
+
+    return {
+        "ok": not degraded,
+        "degraded": degraded,
+        "checks": checks,
+        "channels": len(store.list_channels()),
+        "transcodes_tracked": pool.tracked(),
+        "public_base_url": config.PUBLIC_BASE_URL,
+    }

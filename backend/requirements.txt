@@ -6,3 +6,4 @@ python-multipart==0.0.9
 SQLAlchemy==2.0.30
 PyMySQL==1.1.1
 cryptography==42.0.8
+python-dotenv==1.0.1

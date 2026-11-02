@@ -64,11 +64,48 @@ class TranscodePool:
         self._queue: asyncio.Queue[Job] = asyncio.Queue()
         self._status: dict[tuple, JobStatus] = {}
         self._errors: dict[tuple, str] = {}
+        # When each key was last touched, so finished work can be forgotten.
+        self._seen: dict[tuple, float] = {}
         self._tasks: list[asyncio.Task] = []
         self._status_cb: Optional[Callable[[dict], Awaitable[None]]] = None
 
     def set_status_callback(self, cb: Callable[[dict], Awaitable[None]]) -> None:
         self._status_cb = cb
+
+    def prune(self, max_age: float) -> int:
+        """Forget jobs finished longer than ``max_age`` ago.
+
+        One key is kept per (channel, variant, overlay, segment), so without
+        this the map grows for the life of the process — on a channel running
+        continuously that is unbounded. Only settled work is dropped: a key
+        still PENDING or PROCESSING is what the manifest gate reads, and
+        removing it would make a segment look un-queued and be transcoded
+        twice. The segments themselves are already gone by then (the retention
+        sweep uses the same window), so a later request re-queues rather than
+        trusting a stale READY."""
+        cutoff = time.monotonic() - max_age
+        done = (JobStatus.READY, JobStatus.FAILED)
+        stale = [k for k, seen in self._seen.items()
+                 if seen < cutoff and self._status.get(k) in done]
+        for key in stale:
+            self._status.pop(key, None)
+            self._errors.pop(key, None)
+            self._seen.pop(key, None)
+        if stale:
+            log.info("pruned %d settled transcode record(s); %d tracked",
+                     len(stale), len(self._status))
+        return len(stale)
+
+    def tracked(self) -> int:
+        """How many transcode records are held, so health can show the prune
+        is keeping up rather than leaving it to be discovered as memory growth."""
+        return len(self._status)
+
+    def _set(self, key: tuple, status: JobStatus) -> None:
+        """Record a job's status and when it was touched, so prune() can tell
+        settled work from work the manifest gate is still waiting on."""
+        self._status[key] = status
+        self._seen[key] = time.monotonic()
 
     def start(self) -> None:
         for _ in range(self._workers):
@@ -100,9 +137,9 @@ class TranscodePool:
             return st
         out = _out_path(*job.key)
         if out.exists() and out.stat().st_size > 0:
-            self._status[job.key] = JobStatus.READY
+            self._set(job.key, JobStatus.READY)
             return JobStatus.READY
-        self._status[job.key] = JobStatus.PENDING
+        self._set(job.key, JobStatus.PENDING)
         self._queue.put_nowait(job)
         log.info("transcode QUEUED  ch=%s v%s seq=%s overlay=%s qdepth=%d origin=%s",
                  job.channel_id, job.variant_index, job.seq, job.overlay_id,
@@ -125,7 +162,7 @@ class TranscodePool:
     async def _run(self) -> None:
         while True:
             job = await self._queue.get()
-            self._status[job.key] = JobStatus.PROCESSING
+            self._set(job.key, JobStatus.PROCESSING)
             await self._emit(job, JobStatus.PROCESSING)
             started = time.monotonic()
             log.info("transcode STARTED ch=%s v%s seq=%s overlay=%s type=%s at=%s",
@@ -139,20 +176,20 @@ class TranscodePool:
                     job.mux_offset, out)
                 ms = int((time.monotonic() - started) * 1000)
                 if ok:
-                    self._status[job.key] = JobStatus.READY
+                    self._set(job.key, JobStatus.READY)
                     size = out.stat().st_size if out.exists() else 0
                     log.info("transcode DONE    ch=%s v%s seq=%s overlay=%s in %dms "
                              "(%d bytes) at=%s", job.channel_id, job.variant_index,
                              job.seq, job.overlay_id, ms, size, _now_iso())
                     await self._emit(job, JobStatus.READY)
                 else:
-                    self._status[job.key] = JobStatus.FAILED
+                    self._set(job.key, JobStatus.FAILED)
                     self._errors[job.key] = err
                     log.warning("transcode FAILED ch=%s v%s seq=%s after %dms",
                                 job.channel_id, job.variant_index, job.seq, ms)
                     await self._emit(job, JobStatus.FAILED, err)
             except Exception as exc:  # noqa: BLE001 - keep the worker alive
-                self._status[job.key] = JobStatus.FAILED
+                self._set(job.key, JobStatus.FAILED)
                 self._errors[job.key] = str(exc)
                 log.exception("transcode EXCEPTION ch=%s v%s seq=%s: %s",
                               job.channel_id, job.variant_index, job.seq, exc)

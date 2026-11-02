@@ -1,8 +1,13 @@
 """Runtime configuration for the overlay backend.
 
-Values can be overridden with environment variables so the same code runs both
-against the local origin simulator (in this environment) and against a real
-CloudFront/transmit origin on the user's own machine.
+Every value comes from the environment, loaded from a .env file beside the
+backend if one exists, so the same code runs against the local origin simulator
+or a real CDN origin without edits.
+
+Secrets have NO defaults on purpose. A password written here would be committed
+to the repository, and a default that silently works is a default nobody sets.
+Anything secret is declared in SECRETS below and the app refuses to start
+without it, naming what is missing. See .env.example.
 """
 from __future__ import annotations
 
@@ -13,6 +18,29 @@ from pathlib import Path
 
 # Repo root = .../<repo>/backend/app/config.py -> parents[2]
 REPO_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_dotenv() -> None:
+    """Load backend/.env (then repo-root .env) into the environment.
+
+    Real environment variables already set always win, so a container or a
+    systemd unit can override the file without editing it.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ImportError:  # python-dotenv is optional; env vars still work
+        return
+    for candidate in (BACKEND_ROOT / ".env", REPO_ROOT / ".env"):
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+
+
+_load_dotenv()
+
+
+class ConfigError(RuntimeError):
+    """A required setting is missing, so the process should not start."""
 
 
 def _int(name: str, default: int) -> int:
@@ -22,14 +50,24 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-# Where transcoded overlay segments and uploaded overlay images live.
-DATA_DIR = Path(os.environ.get("OVERLAY_DATA_DIR", "/tmp/instream-overlay-data"))
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# Where transcoded overlay segments and uploaded overlay images live. Defaults
+# beside the backend rather than in a temp directory, which is wiped on reboot
+# and differs per operating system.
+DATA_DIR = Path(os.environ.get("OVERLAY_DATA_DIR", str(BACKEND_ROOT / "data")))
 SEGMENT_DIR = DATA_DIR / "segments"
 UPLOAD_DIR = DATA_DIR / "uploads"
 
 # Public base URL of THIS backend, used when rewriting manifests so players and
-# hls.js fetch our child manifests / overlaid segments from the right host.
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://107.109.131.68:8000").rstrip("/")
+# hls.js fetch our child manifests / overlaid segments from the right host. It
+# must be the address a viewer can reach, not the address we bind to.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
 # How far behind the live edge we hold our manifest, in segments. This is the
 # processing headroom that lets the worker transcode overlay segments before a
@@ -75,25 +113,58 @@ HWACCEL = os.environ.get("OVERLAY_HWACCEL", "qsv").strip().lower()
 SQUEEZE_IN = float(os.environ.get("OVERLAY_SQUEEZE_IN", "0.6"))
 SQUEEZE_OUT = float(os.environ.get("OVERLAY_SQUEEZE_OUT", "0.6"))
 
-# Verify TLS certificates when fetching origin manifests. Many live origins sit
-# behind CDNs with chains the host can't validate, so this defaults to off.
-# Set OVERLAY_VERIFY_TLS=1 to re-enable verification.
-VERIFY_TLS = os.environ.get("OVERLAY_VERIFY_TLS", "0") not in ("0", "false", "False", "")
+# Verify TLS certificates when fetching origin manifests. On by default: an
+# unverified fetch is a silent opening for anyone between us and the origin to
+# substitute the stream. Set OVERLAY_VERIFY_TLS=0 only for a origin whose chain
+# the host genuinely cannot validate, and treat that as temporary.
+VERIFY_TLS = _bool("OVERLAY_VERIFY_TLS", True)
+
+
+# --- retention -------------------------------------------------------------
+# Transcoded overlay segments are written per variant per segment and are only
+# ever needed while they sit inside the output DVR window. Without a sweep they
+# accumulate until the disk fills, so anything older than this is deleted.
+SEGMENT_RETENTION_SECONDS = _int("OVERLAY_SEGMENT_RETENTION", 1800)
+# How often the sweeper runs (seconds).
+RETENTION_INTERVAL = _int("OVERLAY_RETENTION_INTERVAL", 300)
+# Free space below which health reports degraded (MB).
+MIN_FREE_DISK_MB = _int("OVERLAY_MIN_FREE_DISK_MB", 2048)
 
 
 # --- MySQL ----------------------------------------------------------------
+# Set DB_ENABLED=0 to run purely in-memory (no MySQL required).
+DB_ENABLED = _bool("DB_ENABLED", True)
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = _int("DB_PORT", 3306)
 DB_USER = os.environ.get("DB_USER", "root")
-DB_PASS = os.environ.get("DB_PASS", "Piyush@23")
 DB_NAME = os.environ.get("DB_NAME", "instream_overlay")
-# Set DB_ENABLED=0 to run purely in-memory (no MySQL required).
-DB_ENABLED = os.environ.get("DB_ENABLED", "1") not in ("0", "false", "False", "")
+# No default: a password committed to source is a leaked password, and one that
+# silently works is one nobody ever sets. Required only when the DB is enabled.
+DB_PASS = os.environ.get("DB_PASS")
+
+# name -> why it is needed, checked by require_settings() at startup.
+SECRETS = {"DB_PASS": "the MySQL password (set DB_ENABLED=0 to run in-memory)"}
+
+
+def require_settings() -> None:
+    """Fail fast, naming every missing setting at once rather than crashing on
+    first use with a driver error that does not say what to fix."""
+    missing = []
+    if DB_ENABLED:
+        for name, why in SECRETS.items():
+            if not os.environ.get(name):
+                missing.append(f"  {name} — {why}")
+    if missing:
+        raise ConfigError(
+            "Missing required configuration:\n" + "\n".join(missing)
+            + f"\n\nSet them in {BACKEND_ROOT / '.env'} (copy .env.example) or"
+              " in the environment."
+        )
 
 
 def db_url(include_db: bool = True) -> str:
     from urllib.parse import quote_plus
-    auth = f"{quote_plus(DB_USER)}:{quote_plus(DB_PASS)}"
+    auth = f"{quote_plus(DB_USER)}:{quote_plus(DB_PASS or '')}"
     base = f"mysql+pymysql://{auth}@{DB_HOST}:{DB_PORT}"
     return f"{base}/{DB_NAME}" if include_db else base
 

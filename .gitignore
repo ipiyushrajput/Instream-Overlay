@@ -7,7 +7,16 @@ __pycache__/
 frontend/node_modules/
 frontend/dist/
 
+# Secrets — never commit. Only .env.example belongs in the repo.
+.env
+.env.*
+!.env.example
+
 # Runtime data
 /tmp/instream-overlay-data/
+backend/data/
 *.log
 logs/
+
+# Tests
+.pytest_cache/
