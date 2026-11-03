@@ -20,40 +20,69 @@ backend/    FastAPI server: ingest + manifest mirror/rewrite + ffmpeg overlay
             transcode pool + overlaid-segment cache/serving + status websocket
 frontend/   React + Vite + hls.js operator console (player, overlay controls)
 tools/      gen_origin.py — local multi-variant LIVE HLS origin simulator
-scripts/    setup.sh
+deploy/     setup-ubuntu.sh, setup-windows.ps1, systemd unit, nginx config
 docs/       research + architecture
 ```
 
 ## Requirements
 
-- `ffmpeg` / `ffprobe` on PATH (`sudo apt-get install -y ffmpeg`)
+- `ffmpeg` / `ffprobe` on PATH
 - Python 3.11+
-- Node 18+
+- Node 18+ (Vite 5)
+- MySQL 8 — optional, `DB_ENABLED=0` runs in memory
 
 ## Quick start
 
-```bash
-./scripts/setup.sh          # installs ffmpeg (if needed) + python/node deps
-make demo                   # runs origin sim + backend + frontend together
-```
-
-Then open the operator console at **http://127.0.0.1:5173**. The master URL is
-pre-filled with the local origin simulator. Click **Ingest**, then upload an
-overlay PNG and **Schedule overlay**.
-
-### Run the pieces manually
+**[`SETUP.md`](SETUP.md) has the full Ubuntu and Windows instructions**,
+including production deployment with systemd + nginx. The short version:
 
 ```bash
-# 1) local origin (stands in for CloudFront; the real URL works too)
-python3 tools/gen_origin.py --port 8100
-
-# 2) backend
-cd backend && . .venv/bin/activate
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# 3) frontend
-cd frontend && npm run dev
+# Ubuntu — installs system packages, the venv and the frontend build
+bash deploy/setup-ubuntu.sh
 ```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File deploy\setup-windows.ps1
+```
+
+Then set `DB_PASS` and `PUBLIC_BASE_URL` in `backend/.env` (copied from
+`.env.example`; the backend refuses to start without `DB_PASS` unless
+`DB_ENABLED=0`) and run the pieces:
+
+```bash
+# Ubuntu
+python3 tools/gen_origin.py --port 8100                    # 1) local origin
+cd backend && .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000   # 2)
+cd frontend && npm run dev                                 # 3) console
+```
+
+```powershell
+# Windows
+python tools\gen_origin.py --port 8100
+cd backend; .venv\Scripts\uvicorn.exe app.main:app --host 0.0.0.0 --port 8000
+cd frontend; npm run dev
+```
+
+Then open the operator console at **http://127.0.0.1:5173**. Click **Ingest**,
+then upload an overlay PNG and **Schedule overlay**.
+
+> Against the local simulator, add `OVERLAY_BUFFER_SEGMENTS=2`: the simulator's
+> live window is only 6 segments deep and the default hold-back of 6 consumes all
+> of it, leaving an output manifest with no segments.
+
+In production the frontend is built (`npm run build`) and served by nginx, not
+by `npm run dev` — see [`SETUP.md`](SETUP.md#production-deployment-on-ubuntu).
+`VITE_API_BASE` is baked into the bundle at build time and must be a URL the
+browser can reach.
+
+### Tests
+
+```bash
+cd backend && .venv/bin/pip install -r requirements-dev.txt && .venv/bin/pytest -q
+```
+
+No database or ffmpeg needed.
 
 ### Use a real origin
 
@@ -89,6 +118,8 @@ curl -X POST http://127.0.0.1:8000/api/ingest \
 | GET  | `/api/channels/{cid}/overlays` | list overlays with `status` (scheduled/active/completed/expired) + `injected_count` |
 | DELETE | `/api/overlays/{id}` | remove an overlay |
 | GET  | `/api/channels/{cid}/debug` | per-segment PDT / coverage / transcode status |
+| GET  | `/api/channels/{cid}/insights` | viewer sessions + overlay deliveries for a channel |
+| GET  | `/api/health` | database / ffmpeg / ffprobe / free disk; **503** when degraded |
 | WS   | `/ws` | per-segment transcode + overlay lifecycle events |
 
 ### Playback correctness (how the live playlist stays valid)
@@ -103,29 +134,50 @@ referenced with **relative** URLs (`/segment/…`); origin segments keep their
 absolute origin URLs. This is what eliminates the `levelParsingError` /
 buffering you get when a manifest mutates already-published segments.
 
-## Configuration (env vars)
+## Configuration
+
+Everything comes from the environment. `backend/.env` is loaded at startup if
+present (real environment variables win over it), so a systemd unit or container
+can override without editing the file. **[`backend/.env.example`](backend/.env.example)
+is the authoritative list** — copy it to `backend/.env` and edit. `.env` is
+gitignored and must never be committed.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | base used when rewriting manifests |
-| `OVERLAY_BUFFER_SEGMENTS` | `3` | how far behind live we hold the output |
-| `OVERLAY_MAX_WORKERS` | `4` | concurrent ffmpeg transcodes |
-| `OVERLAY_DATA_DIR` | `/tmp/instream-overlay-data` | overlaid segments + uploads |
-| `OVERLAY_LOG_LEVEL` | `INFO` | set `DEBUG` to log the full ffmpeg command per transcode |
-| `OVERLAY_VERIFY_TLS` | `0` | set `1` to verify origin TLS certs |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | the address a **viewer** reaches; every manifest/segment URL is built from it |
+| `OVERLAY_BUFFER_SEGMENTS` | `6` | how far behind live we hold the output (the transcode headroom). **Must stay below the origin's window depth** — at or above it, the hold-back consumes the whole window and the output manifest comes back empty |
+| `OVERLAY_HEVC_EXTRA_BUFFER` | `3` | extra hold-back when the origin is HEVC (libx265 is heavier) |
+| `OVERLAY_MAX_WORKERS` | `6` | concurrent ffmpeg transcodes; enough to run all variants of a segment in parallel |
+| `OVERLAY_HWACCEL` | `qsv` | `none` \| `qsv` \| `nvenc`; a failed hardware encode retries in software |
 | `OVERLAY_ENCODER_PRESET` | `ultrafast` | x264/x265 preset for the squeezed overlay segments |
-| `OVERLAY_ENCODER_CRF` | `23` | encode quality for overlay segments |
-| `DB_HOST` / `DB_PORT` | `localhost` / `3306` | MySQL connection |
-| `DB_USER` / `DB_PASS` / `DB_NAME` | `root` / … / `instream_overlay` | MySQL auth + database |
+| `OVERLAY_ENCODER_CRF` | `28` | encode quality for overlay segments |
+| `OVERLAY_ENCODER_THREADS` | `1` | per-encode thread cap (`0` = let ffmpeg choose) |
+| `OVERLAY_DATA_DIR` | `backend/data` | overlaid segments + uploads; must persist across reboots |
+| `OVERLAY_SEGMENT_RETENTION` | `1800` | transcoded segments older than this (seconds) are swept |
+| `OVERLAY_RETENTION_INTERVAL` | `300` | how often the sweeper runs (seconds) |
+| `OVERLAY_MIN_FREE_DISK_MB` | `2048` | free space below which `/api/health` reports degraded |
+| `OVERLAY_VERIFY_TLS` | `1` | verify origin TLS certs; set `0` only for a chain this host cannot validate |
+| `OVERLAY_LOG_LEVEL` | `INFO` | set `DEBUG` to log the full ffmpeg command per transcode |
+| `OVERLAY_LOG_DIR` | `<repo>/logs` | rotating `backend.log` location |
+| `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | absolute paths if they are not on the service's PATH |
 | `DB_ENABLED` | `1` | set `0` to run purely in-memory (no MySQL) |
+| `DB_HOST` / `DB_PORT` | `localhost` / `3306` | MySQL connection |
+| `DB_USER` / `DB_NAME` | `root` / `instream_overlay` | MySQL user + database |
+| `DB_PASS` | **none — required** | no default on purpose; the app stops at startup and names it if unset |
 
 ## Database (MySQL)
 
 Channels and overlays are persisted to MySQL so registered channels survive
 restarts. The database (`instream_overlay`) and its tables are created
-automatically on first run. Provide credentials via the `DB_*` env vars above
-(defaults match a local `root` MySQL). If MySQL is unreachable the backend logs
-a warning and continues in-memory. The four overlay types are **L-band**,
+automatically on first run, so a user granted `ALL PRIVILEGES ON
+instream_overlay.*` is enough. If MySQL is unreachable the backend logs a
+warning and continues in-memory.
+
+> On Ubuntu, `root@localhost` authenticates over the unix socket rather than
+> with a password, so the backend cannot log in as root over TCP. Create a
+> dedicated user — see [`SETUP.md`](SETUP.md#3-mysql).
+
+The four overlay types are **L-band**,
 **top_band**, **bottom_band**, and **pip**, each rendered as an animated
 squeeze-back (the main video is scaled into a pocket while the band/ad art
 shows in the freed area), encoded to match the origin codec (HEVC or H.264).

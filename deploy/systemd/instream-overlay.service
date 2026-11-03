@@ -1,0 +1,60 @@
+; Instream Overlay backend as a systemd service (Ubuntu).
+;
+; Install:
+;   sudo cp deploy/systemd/instream-overlay.service /etc/systemd/system/
+;   sudo systemctl daemon-reload
+;   sudo systemctl enable --now instream-overlay
+;   sudo systemctl status instream-overlay
+;   journalctl -u instream-overlay -f
+;
+; Adjust WorkingDirectory/ExecStart/User if the checkout is not at
+; /opt/instream-overlay or the service user is not "overlay".
+
+[Unit]
+Description=Instream Overlay backend (TV Plus STUDIO)
+Documentation=file:/opt/instream-overlay/SETUP.md
+; network-online rather than network: we fetch origin manifests on startup, and
+; a route that is not up yet turns the first ingest into a DNS failure.
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=overlay
+Group=overlay
+WorkingDirectory=/opt/instream-overlay/backend
+
+; Configuration comes from backend/.env, which the app loads itself (python-dotenv)
+; using a path relative to the code, not the working directory. That keeps values
+; with "#" or spaces in them working — systemd's EnvironmentFile parser would
+; need them quoted. Set anything here only to OVERRIDE that file:
+;   Environment=OVERLAY_LOG_LEVEL=DEBUG
+
+; Bind to localhost only: nginx terminates the public port and proxies here.
+; Drop --host to 0.0.0.0 if you are running without nginx.
+ExecStart=/opt/instream-overlay/backend/.venv/bin/uvicorn app.main:app \
+          --host 127.0.0.1 --port 8000 --proxy-headers \
+          --forwarded-allow-ips=127.0.0.1
+
+; A transcode wedging the event loop should not take the stream down for good.
+Restart=always
+RestartSec=3
+; ffmpeg children must die with the parent, or a reload leaks encoders that keep
+; writing segments nobody will serve.
+KillMode=control-group
+TimeoutStopSec=20
+
+; --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+; /usr, /boot and /etc read-only; /opt stays writable, so the two paths the app
+; actually writes are named explicitly.
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/instream-overlay/backend/data /opt/instream-overlay/logs
+; Transcoding is the whole workload, so leave CPU alone, but cap memory so a
+; runaway encode is killed instead of taking the host with it.
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target
